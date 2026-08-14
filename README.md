@@ -468,6 +468,101 @@ db.all('SELECT * FROM t');                       // row[]
 db.transaction(() => { /* BEGIN / COMMIT, nested = savepoints */ });
 ```
 
+## Production considerations
+
+SQLite is single‑writer: concurrent writers can hit `SQLITE_BUSY`. Sqlo
+exposes these errors honestly (it never simulates locks) but gives you the
+tools to handle them:
+
+```ts
+import { Sqlo, isBusyError, isConstraintError } from '@chaeco/sqlo';
+
+try {
+  db.exec('INSERT ...');
+} catch (err) {
+  if (isBusyError(err)) {
+    // Another connection holds the write lock. Back off and retry,
+    // or degrade. (node:sqlite errors carry errcode/errstr.)
+  } else if (isConstraintError(err)) {
+    // UNIQUE / NOT NULL / CHECK / FK violation.
+  }
+}
+```
+
+### Automatic retry on lock contention
+
+`db.transaction(fn, { retry: n })` re‑runs the whole transaction from a fresh
+`BEGIN` with exponential backoff (50ms, 100ms, 200ms, …) when the database is
+locked. Non‑busy errors propagate immediately. Nested (SAVEPOINT)
+transactions are never retried — they belong to the outer transaction:
+
+```ts
+db.transaction(() => {
+  orders.insert({ id: 1, amount: 99 });
+  orders.insert({ id: 2, amount: 10 });
+}, { retry: 5 });   // survives transient write contention
+```
+
+### Batching large inserts
+
+`insertMany(rows, { chunkSize })` inserts in chunks, each chunk in its own
+transaction (when not already inside an outer transaction) — keeping
+write‑lock hold time and memory bounded for very large batches:
+
+```ts
+model.insertMany(bigRows, { chunkSize: 1000 });
+// Chunk 1 commits; if chunk 2 fails, chunk 1 stays and the error propagates.
+```
+
+### Behaviour logging
+
+Every operation is observable through an opt-in logging window — queries
+(with bound parameters, exposed verbatim), transactions, schema operations,
+migrations and connection lifecycle. Sanitizing sensitive data is the
+caller's responsibility:
+
+```ts
+const db = new Sqlo({
+  path: './app.db',
+  onLog: (entry) => {
+    // entry: { level, event, message, sql?, params?, durationMs?, detail?, timestamp }
+    myLogger.log(entry.level, `[${entry.event}] ${entry.message}`, entry);
+  },
+  logLevel: 'info',        // 'debug' | 'info' | 'warn'(default) | 'error'
+});
+
+db.all('SELECT * FROM users WHERE email = ?', 'a@b.c');
+// onLog receives { event: 'query', sql: 'SELECT ...', params: ['a@b.c'], durationMs: 0.3, ... }
+```
+
+Events: `query` (exec/all/get/run), `transaction` (BEGIN/COMMIT/ROLLBACK/
+SAVEPOINT/retry), `schema` (define), `connection` (open/close/attach/detach/
+backup), `migrate` (applied/pending/failed). The default `logLevel` is `warn`
+(only warnings and errors); set `'debug'` to observe every query. A throwing
+`onLog` never breaks the database operation.
+
+### Connection introspection
+
+```ts
+db.isOpen;                 // boolean — connection still open
+db.version;                // SQLite library version, e.g. '3.46.0'
+db.databaseList();         // [{ name, file }, ...] — main + attached DBs
+db.tableExists('users');   // boolean — also 'schema.table' for attached DBs
+```
+
+### Online backups
+
+`db.backup(targetPath)` takes a consistent snapshot using SQLite's
+`VACUUM INTO` (works while the database is in use; also persists an in‑memory
+database to disk):
+
+```ts
+db.backup('/backups/app-2026-08-14.db');
+```
+
+`model.deleteAll()` is the explicit full‑table clear (unlike `delete()`, no
+WHERE required) — for test resets and bulk cleanup.
+
 ## Multiple databases
 
 Attach additional SQLite database files to the same connection with

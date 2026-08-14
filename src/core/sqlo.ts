@@ -9,6 +9,8 @@ import type { TableDef, MigrationDef, MigrationStatus, RowOf, InsertOf, PatchOf 
 import { Model } from '../model/model.ts';
 import type { Executor } from '../query/query-builder.ts';
 import { quoteIdent } from '../query/sql.ts';
+import { isBusyError } from './error.ts';
+import { shouldLog, type LogEntry, type LogLevel, type LogEvent } from './logging.ts';
 
 // ---------------------------------------------------------------------------
 // SqloOptions
@@ -47,6 +49,20 @@ export interface SqloOptions {
    * `:memory:` databases (they are always in-memory journaling).
    */
   journalMode?: SqliteJournalMode;
+  /**
+   * Behaviour logging window. Provide a callback to observe what Sqlo does —
+   * queries, transactions, schema operations, connection lifecycle. Logging
+   * is opt-in and never affects behaviour.
+   *
+   * @example
+   * new Sqlo({ path: './app.db', onLog: (e) => console.log(e) })
+   */
+  onLog?: (entry: LogEntry) => void;
+  /**
+   * Minimum level emitted through `onLog`. Defaults to `'warn'` (warn + error).
+   * Set to `'debug'` to observe every query.
+   */
+  logLevel?: LogLevel;
 }
 
 export interface MigrateOptions {
@@ -72,9 +88,11 @@ export interface MigrateOptions {
  */
 export class Sqlo implements Executor {
   readonly #db: DatabaseSyncType;
-  readonly #options: Required<SqloOptions>;
+  readonly #options: Required<Omit<SqloOptions, 'onLog'>> & { onLog?: (entry: LogEntry) => void };
   #models: Map<string, { sync(): void }> = new Map();
   #closed = false;
+  /** Re-entry guard: prevents an `onLog` callback from triggering new log events. */
+  #logging = false;
 
   /**
    * Open (or create) a SQLite database.
@@ -97,6 +115,8 @@ export class Sqlo implements Executor {
       allowExtension: opts.allowExtension ?? false,
       busyTimeout: opts.busyTimeout ?? 0,
       journalMode: opts.journalMode ?? 'DELETE',
+      logLevel: opts.logLevel ?? 'warn',
+      ...(opts.onLog !== undefined ? { onLog: opts.onLog } : {}),
     };
 
     this.#db = new DatabaseSync(path, {
@@ -113,6 +133,10 @@ export class Sqlo implements Executor {
     if (opts.journalMode !== undefined && opts.journalMode !== 'DELETE') {
       this.#db.exec(`PRAGMA journal_mode = ${this.#options.journalMode}`);
     }
+
+    this.#log('connection', `open database ${path === ':memory:' ? '(in-memory)' : path}`, {
+      detail: `journalMode=${this.#options.journalMode}, fk=${this.#options.enableForeignKeyConstraints}`,
+    });
   }
 
   // ---- Raw access ----
@@ -124,6 +148,89 @@ export class Sqlo implements Executor {
     return this.#db;
   }
 
+  // ---- Connection state & introspection ----
+
+  /**
+   * Whether the underlying database connection is still open.
+   *
+   * Useful for lifecycle management (e.g. checking a cached instance from a
+   * `MultiSqlo` pool, or a worker-owned instance) before using it.
+   */
+  get isOpen(): boolean {
+    return this.#db.isOpen;
+  }
+
+  /**
+   * The SQLite library version (e.g. `3.46.0`).
+   */
+  get version(): string {
+    this.#ensureOpen();
+    const row = this.#db.prepare('SELECT sqlite_version() AS v').get() as { v: string };
+    return row.v;
+  }
+
+  /**
+   * All attached databases with their schema name and backing file path.
+   *
+   * The first entry is always `main`. Attached databases (via `attach()`) are
+   * listed after it. In-memory databases (`:memory:`) report an empty file path.
+   *
+   * Rows are normalized to plain objects (node:sqlite returns null-prototype rows).
+   *
+   * @example
+   * db.databaseList()
+   * // → [{ name: 'main', file: '/private/tmp/app.db' },
+   * //    { name: 'audit', file: '/private/tmp/audit.db' }]
+   */
+  databaseList(): Array<{ name: string; file: string }> {
+    this.#ensureOpen();
+    const rows = this.#db.prepare('PRAGMA database_list').all() as Array<{
+      name: string;
+      file: string;
+    }>;
+    return rows.map((r) => ({ name: r.name, file: r.file }));
+  }
+
+  /**
+   * Check whether a table exists (optionally in a specific attached schema).
+   *
+   * Lightweight alternative to `reflectTableSchema` when you only need an
+   * existence check — e.g. before `sync()`/`migrate()`, or in setup logic.
+   *
+   * @param name Table name, optionally `schema.table` (e.g. `'audit.logs'`).
+   */
+  tableExists(name: string): boolean {
+    this.#ensureOpen();
+    let schema: string | undefined;
+    let table = name;
+    const dot = name.indexOf('.');
+    if (dot > 0) {
+      schema = name.slice(0, dot);
+      table = name.slice(dot + 1);
+    }
+    const sql = schema
+      ? `SELECT 1 FROM ${quoteIdent(schema)}.sqlite_master WHERE type = 'table' AND tbl_name = ?`
+      : 'SELECT 1 FROM sqlite_master WHERE type = \'table\' AND tbl_name = ?';
+    const row = this.#db.prepare(sql).get(table) as { 1: number } | undefined;
+    return row !== undefined;  }
+
+  /**
+   * Create an online backup of the current database to another file.
+   *
+   * Uses SQLite's `VACUUM INTO` (available since SQLite 3.27), which takes a
+   * consistent snapshot even while the database is in use. The target path is
+   * parameter-bound. Useful for pre-migration snapshots, scheduled backups, or
+   * per-user backups in a `MultiSqlo` setup.
+   *
+   * @param target File path of the backup to create.
+   */
+  backup(target: string): void {
+    this.#ensureOpen();
+    const started = performance.now();
+    this.#db.prepare('VACUUM INTO ?').run(target);
+    this.#log('connection', `backup to ${target}`, { detail: `took ${(performance.now() - started).toFixed(1)}ms` });
+  }
+
   // ---- Low-level helpers ----
 
   /**
@@ -131,7 +238,9 @@ export class Sqlo implements Executor {
    */
   exec(sql: string): void {
     this.#ensureOpen();
+    const started = performance.now();
     this.#db.exec(sql);
+    this.#log('query', `exec: ${sql}`, { sql, durationMs: performance.now() - started });
   }
 
   /**
@@ -142,8 +251,11 @@ export class Sqlo implements Executor {
     ...params: unknown[]
   ): T[] {
     this.#ensureOpen();
+    const started = performance.now();
     const stmt = this.#db.prepare(sql);
-    return plainRows(stmt.all(...params as SQLInputValue[]) as T[]);
+    const rows = plainRows(stmt.all(...params as SQLInputValue[]) as T[]);
+    this.#log('query', `all: ${sql}`, { sql, params, durationMs: performance.now() - started });
+    return rows;
   }
 
   /**
@@ -154,8 +266,11 @@ export class Sqlo implements Executor {
     ...params: unknown[]
   ): T | undefined {
     this.#ensureOpen();
+    const started = performance.now();
     const stmt = this.#db.prepare(sql);
-    return plainRow(stmt.get(...params as SQLInputValue[]) as T | undefined);
+    const row = plainRow(stmt.get(...params as SQLInputValue[]) as T | undefined);
+    this.#log('query', `get: ${sql}`, { sql, params, durationMs: performance.now() - started });
+    return row;
   }
 
   /**
@@ -166,8 +281,11 @@ export class Sqlo implements Executor {
     ...params: unknown[]
   ): { changes: number | bigint; lastInsertRowid: number | bigint } {
     this.#ensureOpen();
+    const started = performance.now();
     const stmt = this.#db.prepare(sql);
-    return stmt.run(...params as SQLInputValue[]);
+    const result = stmt.run(...params as SQLInputValue[]);
+    this.#log('query', `run: ${sql}`, { sql, params, durationMs: performance.now() - started });
+    return result;
   }
 
   /**
@@ -180,17 +298,68 @@ export class Sqlo implements Executor {
   } {
     this.#ensureOpen();
     const stmt = this.#db.prepare(sql);
+    const self = this;
     return {
       all(...params: unknown[]): Record<string, unknown>[] {
-        return plainRows(stmt.all(...params as SQLInputValue[]) as Record<string, unknown>[]);
+        const started = performance.now();
+        const rows = plainRows(stmt.all(...params as SQLInputValue[]) as Record<string, unknown>[]);
+        self.#log('query', `all: ${sql}`, { sql, params, durationMs: performance.now() - started });
+        return rows;
       },
       get(...params: unknown[]): Record<string, unknown> | undefined {
-        return plainRow(stmt.get(...params as SQLInputValue[]) as Record<string, unknown> | undefined);
+        const started = performance.now();
+        const row = plainRow(stmt.get(...params as SQLInputValue[]) as Record<string, unknown> | undefined);
+        self.#log('query', `get: ${sql}`, { sql, params, durationMs: performance.now() - started });
+        return row;
       },
       run(...params: unknown[]): { changes: number | bigint; lastInsertRowid: number | bigint } {
-        return stmt.run(...params as SQLInputValue[]);
+        const started = performance.now();
+        const result = stmt.run(...params as SQLInputValue[]);
+        self.#log('query', `run: ${sql}`, { sql, params, durationMs: performance.now() - started });
+        return result;
       },
     };
+  }
+
+  // ---- Behaviour logging ----
+
+  /**
+   * Emit a behaviour log entry through the configured `onLog` window,
+   * filtered by `logLevel`. No-op when no window is configured.
+   *
+   * Re-entrancy guard: while `onLog` is executing, any further `#log` calls
+   * are dropped. This prevents an `onLog` callback that itself performs
+   * database operations (e.g. writing logs to a table) from recursively
+   * triggering new log events.
+   */
+  #log(
+    event: LogEvent,
+    message: string,
+    fields?: { sql?: string; params?: unknown[]; durationMs?: number; detail?: string; level?: LogLevel },
+  ): void {
+    const onLog = this.#options.onLog;
+    if (!onLog) return;
+    if (this.#logging) return; // drop nested events — never recurse
+    const level = fields?.level ?? 'info';
+    if (!shouldLog(level, this.#options.logLevel)) return;
+    const entry: LogEntry = {
+      level,
+      event,
+      message,
+      timestamp: Date.now(),
+      ...(fields?.sql !== undefined ? { sql: fields.sql } : {}),
+      ...(fields?.params !== undefined ? { params: fields.params } : {}),
+      ...(fields?.durationMs !== undefined ? { durationMs: Math.round(fields.durationMs * 10) / 10 } : {}),
+      ...(fields?.detail !== undefined ? { detail: fields.detail } : {}),
+    };
+    this.#logging = true;
+    try {
+      onLog(entry);
+    } catch {
+      // A user log handler must never break the database operation.
+    } finally {
+      this.#logging = false;
+    }
   }
 
   // ---- Transaction ----
@@ -206,13 +375,61 @@ export class Sqlo implements Executor {
    *   db.exec('INSERT ...');
    * });
    * ```
+   *
+   * Production concurrency: SQLite is single-writer, so concurrent writers can
+   * hit `SQLITE_BUSY`. Pass `{ retry: n }` to automatically re-run the whole
+   * transaction (from a fresh `BEGIN`) with exponential backoff when the
+   * database is locked. Other errors propagate immediately. Retries only apply
+   * to top-level transactions — a nested (SAVEPOINT) transaction belongs to an
+   * outer one and is never retried.
+   *
+   * @example
+   * db.transaction(() => {
+   *   orders.insert({ ... });
+   * }, { retry: 5 });
    */
-  transaction<T>(fn: () => T): T {
+  transaction<T>(fn: () => T, options?: { retry?: number }): T {
     this.#ensureOpen();
-    if (this.#txDepth === 0) {
+
+    // Nested transactions (SAVEPOINT) are never retried — they share the outer
+    // transaction's fate and can't be re-entered independently.
+    if (this.#txDepth > 0 || (options?.retry ?? 0) <= 0) {
+      return this.#transactionOnce(fn);
+    }
+
+    const maxRetries = options!.retry!;
+    let attempt = 0;
+    for (;;) {
+      try {
+        return this.#transactionOnce(fn);
+      } catch (err) {
+        if (!isBusyError(err) || attempt >= maxRetries) throw err;
+        attempt++;
+        this.#log('transaction', `retry transaction (attempt ${attempt}/${maxRetries}) after SQLITE_BUSY`, {
+          detail: `backoff delay computed for attempt ${attempt}`,
+          level: 'warn',
+        });
+        // Exponential backoff: 50ms, 100ms, 200ms, ...
+        const delay = 50 * 2 ** (attempt - 1);
+        const deadline = Date.now() + delay;
+        // Busy-wait via Atomics.wait is not available in the main thread; a
+        // synchronous sleep is the honest way to back off in a sync-first API.
+        while (Date.now() < deadline) {
+          // spin
+        }
+      }
+    }
+  }
+
+  #transactionOnce<T>(fn: () => T): T {
+    this.#ensureOpen();
+    const isTop = this.#txDepth === 0;
+    if (isTop) {
       this.#db.exec('BEGIN');
+      this.#log('transaction', 'BEGIN transaction');
     } else {
       this.#db.exec(`SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
+      this.#log('transaction', `BEGIN SAVEPOINT (depth ${this.#txDepth})`);
     }
     this.#txDepth++;
 
@@ -221,16 +438,20 @@ export class Sqlo implements Executor {
       this.#txDepth--;
       if (this.#txDepth === 0) {
         this.#db.exec('COMMIT');
+        this.#log('transaction', 'COMMIT transaction');
       } else {
         this.#db.exec(`RELEASE SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
+        this.#log('transaction', `RELEASE SAVEPOINT (depth ${this.#txDepth})`);
       }
       return result;
     } catch (err) {
       this.#txDepth--;
       if (this.#txDepth === 0) {
         this.#db.exec('ROLLBACK');
+        this.#log('transaction', 'ROLLBACK transaction', { level: 'warn' });
       } else {
         this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
+        this.#log('transaction', `ROLLBACK TO SAVEPOINT (depth ${this.#txDepth})`, { level: 'warn' });
       }
       throw err;
     }
@@ -257,6 +478,7 @@ export class Sqlo implements Executor {
     // The schema name cannot be a bound parameter — it's an identifier, so
     // it is validated and quoted; the file path is always bound.
     this.#db.prepare(`ATTACH DATABASE ? AS ${ident}`).run(path);
+    this.#log('connection', `ATTACH database "${name}" from ${path}`);
   }
 
   /**
@@ -266,6 +488,7 @@ export class Sqlo implements Executor {
   detach(name: string): void {
     this.#ensureOpen();
     this.#db.exec(`DETACH DATABASE ${quoteIdent(name)}`);
+    this.#log('connection', `DETACH database "${name}"`);
   }
 
   // ---- Schema & Model ----
@@ -314,6 +537,9 @@ export class Sqlo implements Executor {
 
     const model = new Model<RowOf<S>, InsertOf<S>, PatchOf<S>>(this, schema);
     this.#models.set(schema.name, model);
+    this.#log('schema', `define model for "${schema.name}"`, {
+      detail: `${Object.keys(schema.columns).length} columns, ${schema.indexes?.length ?? 0} indexes`,
+    });
     return model;
   }
 
@@ -363,6 +589,7 @@ export class Sqlo implements Executor {
       this.#txDepth++;
       try {
         this.#applyMigration(m, schema);
+        this.#log('migrate', `applied migration "${m.name}"`, { detail: `schema "${schema}"` });
         this.#txDepth--;
         if (this.#txDepth === 0) {
           this.#db.exec('COMMIT');
@@ -371,6 +598,7 @@ export class Sqlo implements Executor {
         }
       } catch (err) {
         this.#txDepth--;
+        this.#log('migrate', `migration "${m.name}" failed`, { detail: `schema "${schema}"`, level: 'error' });
         if (this.#txDepth === 0) {
           this.#db.exec('ROLLBACK');
         } else {
@@ -381,6 +609,12 @@ export class Sqlo implements Executor {
           { cause: err },
         );
       }
+    }
+
+    if (pending.length > 0) {
+      this.#log('migrate', `applied ${pending.length} migration(s)`, { detail: `schema "${schema}"` });
+    } else {
+      this.#log('migrate', 'no pending migrations', { detail: `schema "${schema}"` });
     }
 
     return pending;
@@ -411,6 +645,7 @@ export class Sqlo implements Executor {
     if (!this.#closed) {
       this.#db.close();
       this.#closed = true;
+      this.#log('connection', 'close database');
     }
   }
 

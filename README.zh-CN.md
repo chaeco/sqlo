@@ -442,6 +442,95 @@ db.all('SELECT * FROM t');                       // row[]
 db.transaction(() => { /* BEGIN / COMMIT，嵌套 = savepoint */ });
 ```
 
+## 生产场景
+
+SQLite 是**单写者**的：并发写入可能触发 `SQLITE_BUSY`。Sqlo 诚实暴露这些
+错误（绝不模拟锁），但提供处理它们的工具：
+
+```ts
+import { Sqlo, isBusyError, isConstraintError } from '@chaeco/sqlo';
+
+try {
+  db.exec('INSERT ...');
+} catch (err) {
+  if (isBusyError(err)) {
+    // 另一个连接持有写锁。退避后重试，或降级处理。
+    // （node:sqlite 错误携带 errcode/errstr。）
+  } else if (isConstraintError(err)) {
+    // UNIQUE / NOT NULL / CHECK / 外键 约束违反。
+  }
+}
+```
+
+### 锁竞争时自动重试
+
+`db.transaction(fn, { retry: n })` 在数据库被锁定时，从全新的 `BEGIN` 以
+指数退避（50ms、100ms、200ms……）重新执行整个事务。非 busy 错误立即抛出。
+嵌套（SAVEPOINT）事务**永不重试**——它们从属于外层事务：
+
+```ts
+db.transaction(() => {
+  orders.insert({ id: 1, amount: 99 });
+  orders.insert({ id: 2, amount: 10 });
+}, { retry: 5 });   // 承受短暂的写竞争
+```
+
+### 大批量插入分块
+
+`insertMany(rows, { chunkSize })` 分块插入，每块独立事务（当不在外层事务
+中时）——让写锁持有时间和内存占用对超大批次保持有界：
+
+```ts
+model.insertMany(bigRows, { chunkSize: 1000 });
+// 块 1 提交；若块 2 失败，块 1 保留，错误向上传播。
+```
+
+### 行为日志
+
+所有操作都可通过可选的日志窗口观察——查询（含绑定参数，**完整暴露**）、
+事务、schema 操作、迁移、连接生命周期。敏感数据的脱敏由**调用方**负责：
+
+```ts
+const db = new Sqlo({
+  path: './app.db',
+  onLog: (entry) => {
+    // entry: { level, event, message, sql?, params?, durationMs?, detail?, timestamp }
+    myLogger.log(entry.level, `[${entry.event}] ${entry.message}`, entry);
+  },
+  logLevel: 'info',        // 'debug' | 'info' | 'warn'(默认) | 'error'
+});
+
+db.all('SELECT * FROM users WHERE email = ?', 'a@b.c');
+// onLog 收到 { event: 'query', sql: 'SELECT ...', params: ['a@b.c'], durationMs: 0.3, ... }
+```
+
+事件：`query`（exec/all/get/run）、`transaction`（BEGIN/COMMIT/ROLLBACK/
+SAVEPOINT/重试）、`schema`（define）、`connection`（open/close/attach/detach/
+backup）、`migrate`（applied/pending/failed）。默认 `logLevel` 为 `warn`
+（只发警告和错误）；设为 `'debug'` 可观察每条查询。抛异常的 `onLog`
+绝不会破坏数据库操作。
+
+### 连接内省
+
+```ts
+db.isOpen;                 // boolean——连接是否仍然打开
+db.version;                // SQLite 库版本，如 '3.46.0'
+db.databaseList();         // [{ name, file }, ...]——main + 附加库
+db.tableExists('users');   // boolean——也支持 'schema.table'（附加库）
+```
+
+### 在线备份
+
+`db.backup(targetPath)` 使用 SQLite 的 `VACUUM INTO` 生成一致性快照
+（数据库使用中也可用；也能把内存库持久化到磁盘）：
+
+```ts
+db.backup('/backups/app-2026-08-14.db');
+```
+
+`model.deleteAll()` 是显式的全表清空（与 `delete()` 不同，无需 WHERE）——
+用于测试重置和批量清理。
+
 ## 多数据库
 
 用 `db.attach(path, name)` 把额外的 SQLite 数据库文件挂载到同一个连接上。挂载后

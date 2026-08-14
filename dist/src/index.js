@@ -5,6 +5,7 @@
  */
 export { Sqlo } from "./core/sqlo.js";
 export { MultiSqlo } from "./core/multi-sqlo.js";
+export { isBusyError, isConstraintError, SQLITE } from "./core/error.js";
 export { Model } from "./model/model.js";
 export { QueryBuilder } from "./query/query-builder.js";
 export { sql, raw, quoteIdent, quoteTable, isFragment, isIdent } from "./query/sql.js";

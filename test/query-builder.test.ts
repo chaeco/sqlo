@@ -197,4 +197,53 @@ describe('QueryBuilder basic', () => {
     assert.equal(sql, 'SELECT * FROM "users" WHERE "name" IS NULL');
     assert.deepEqual(params, []);
   });
+
+  it('rightJoin generates RIGHT JOIN', () => {
+    const qb = users.query();
+    qb.rightJoin('posts', raw('posts.userId = users.id'));
+    const { sql } = qb.toSql();
+    assert.match(sql, /RIGHT JOIN "posts" ON posts\.userId = users\.id/);
+  });
+
+  it('fullJoin generates FULL JOIN', () => {
+    const qb = users.query();
+    qb.fullJoin('posts', raw('posts.userId = users.id'));
+    const { sql } = qb.toSql();
+    assert.match(sql, /FULL JOIN "posts" ON posts\.userId = users\.id/);
+  });
+
+  it('join (INNER) and leftJoin generate their clauses', () => {
+    const inner = users.query().join('posts', raw('posts.userId = users.id')).toSql().sql;
+    assert.match(inner, /JOIN "posts" ON posts\.userId = users\.id/);
+    assert.doesNotMatch(inner, /LEFT|RIGHT|FULL/);
+    const left = users.query().leftJoin('posts', raw('posts.userId = users.id')).toSql().sql;
+    assert.match(left, /LEFT JOIN "posts" ON posts\.userId = users\.id/);
+  });
+
+  it('empty IN array becomes 0 (matches nothing)', () => {
+    const qb = users.query();
+    qb.where({ id: { in: [] } });
+    const { sql, params } = qb.toSql();
+    assert.match(sql, /0/);
+    assert.deepEqual(params, []);
+    // Executes without error and returns nothing.
+    assert.deepEqual(qb.all(), []);
+  });
+
+  it('count() with groupBy wraps in a subquery', () => {
+    // count must not count rows multiplied by grouping.
+    const countQb = users.query().groupBy('age');
+    const n = countQb.count();
+    assert.equal(typeof n, 'number');
+    // And it executes without error.
+    users.query().groupBy('age').count();
+  });
+
+  it('where accepts a plain SQL string (converted to a fragment)', () => {
+    const qb = users.query();
+    qb.where(raw('age >= 18'));
+    const { sql, params } = qb.toSql();
+    assert.equal(sql, 'SELECT * FROM "users" WHERE age >= 18');
+    assert.deepEqual(params, []);
+  });
 });

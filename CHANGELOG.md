@@ -7,6 +7,42 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-14
+
+### Added
+
+- **生产能力：错误分类、事务重试、分块插入、连接内省、在线备份**（生产场景深度思考落地）
+  - **错误分类**（`src/core/error.ts`）：`isBusyError(e)` / `isConstraintError(e)` 类型守卫 + `SQLITE` 结果码常量。node:sqlite 所有错误 `code` 都是 `ERR_SQLITE_ERROR`，但 `errcode` 携带 SQLite 扩展结果码（busy=5、constraint=19，含扩展位 `& 0xff` 处理）；Sqlo 不包装错误（保持薄封装），提供识别工具
+  - **`db.transaction(fn, { retry })`**：SQLITE_BUSY 时指数退避（50/100/200ms…）重跑整个事务；嵌套事务永不重试；非 busy 错误立即抛出
+  - **`model.insertMany(rows, { chunkSize })`**：分块插入，每块独立事务，写锁持有时间和内存有界
+  - **连接内省**：`db.isOpen`（DatabaseSync 透传）、`db.version`（`sqlite_version()`）、`db.databaseList()`（main + 附加库的 name/file，归一化 PRAGMA database_list 行）、`db.tableExists(name)`（支持 `schema.table`，查对应 schema 的 sqlite_master）
+  - **`db.backup(targetPath)`**：`VACUUM INTO` 在线一致性备份（参数绑定路径），内存库也可持久化到磁盘
+  - **`model.deleteAll()`**：显式全表清空（delete() 强制 WHERE 的逃生舱）
+  - **行为日志窗口**（`SqloOptions.onLog` + `logLevel`）：所有操作可观察——`query`（exec/all/get/run，含**完整暴露**的绑定参数，脱敏由调用方负责）、`transaction`（BEGIN/COMMIT/ROLLBACK/SAVEPOINT/重试）、`schema`（define）、`connection`（open/close/attach/detach/backup）、`migrate`（applied/pending/failed）。默认 `logLevel: 'warn'`，`'debug'` 观察每条查询；`onLog` 抛异常不会破坏数据库操作。`LogEntry`/`LogEvent`/`LogLevel` 类型公开导出
+  - **196 个单元测试**（`node --test`），覆盖行 **97.72%** / 分支 **91.76%** / 函数 **94.09%**；`sqlo.js`、`sql.js`、`ddl.js`、`error.js`、`logging.js`、`multi-sqlo.js` 等 100% 行覆盖。测试审计补齐：`rightJoin`/`fullJoin`/`join(INNER)`/`leftJoin`、空 `IN []`、count 分组子查询、where 字符串参数、`quoteTable` 别名、`sql\`\`` 非 tag 调用抛错、`busyTimeout`、表名校验、DEFAULT 含参数抛错、`.cjs` 单对象迁移加载
+
+### Changed
+
+- 包名从 `sqlo` 改为 scoped 包名 **`@chaeco/sqlo`**（package.json / package-lock.json / 两份 README 同步更新）
+- README 完整重写：对齐实际 API，覆盖 Quick start / schema / CRUD / 查询构造器 / 迁移 / 异步封装 / 原始访问 / 设计原则 / 生产场景
+
+### Fixed
+
+- 修复 `node:sqlite` 返回 null-prototype 行对象导致的 `deepEqual` 断言失败与 DX 问题（ORM 层归一化为普通对象）
+- 修复 LIMIT / OFFSET 未参数化的问题（改为绑定参数）
+- 修复可空列无法显式插入 `null` 的类型缺陷（`InsertOf` 类型联合包含 `null`）
+- 修复 Node 24 下 `node --test` 不接受目录路径的问题（改用 glob）
+- 修复 `run()` 结果 `changes` / `lastInsertRowid` 为 `number | bigint` 的强制转换
+- **修复 `having()` 生成 `WHERE` 而非 `HAVING` 的问题**（`#buildWhereClauses` 现支持关键字参数）
+- 修复示例项目 `examples/basic` 的 `node:*` 类型解析（本地安装 `@types/node` + tsconfig 显式 `types: ["node"]`）
+- **`insertMany()` 改为原子事务**（`Executor` 新增可选 `transaction`，Sqlo 实现；支持在外层事务中通过 SAVEPOINT 嵌套）——修复批量插入半写入问题
+- **`migrate()` 支持在外层 `transaction()` 内运行**（复用 `#txDepth` 走 SAVEPOINT，不再裸 `BEGIN` 冲突）
+- **`schemaDiff()` 检测表级选项变更**（`strict` / `withoutRowId` / 表级 `checks` 变化加入 warnings）
+- **`first()` / `pluck()` 不再污染 builder 状态**（终结操作在状态副本上进行，builder 可复用）
+- `AsyncSqlo.run()` 返回类型与同步版统一（`changes: number | bigint`）
+- `Model.exists()` 改用 `LIMIT 1` 查询，大表性能更优
+- **日志回调重入保护**：`onLog` 执行期间触发的嵌套日志事件被丢弃，杜绝回调内执行数据库操作导致的无限递归（实测深度从 2296 降到有界）——日志只允许观察，不允许触发超出框架权限的事件
+
 ## [0.2.0] - 2026-08-14
 
 ### Added
@@ -112,24 +148,3 @@
   - **`journalMode` 连接选项**（`SqloOptions`）：`'WAL'` / `'DELETE'` / `'TRUNCATE'` / `'PERSIST'` / `'MEMORY'` / `'OFF'`，构造器自动执行 `PRAGMA journal_mode`（WAL 持久化到库文件），与 `busyTimeout` 同为常用连接设置的一等公民
   - **`SqliteType` 类型约束**（`src/schema/types.ts`）：`ColumnDef` 默认约束为已知 SQLite 类型名（拼错编译期提示），同时 `TableDef` 允许自定义类型名（SQLite 类型亲和，如 `UUID` / `JSON` / `VARCHAR(255)`），运行时对非标准类型名发一次性 `SQLO_SCHEMA_WARNING` 警告而非报错
   - **150 个单元测试**（`node --test`）覆盖全部核心模块，包括 `AsyncSqlo` worker 封装、JSON 表结构、schema 差异分析/内省、多数据库与附加库迁移、多用户隔离、`journalMode` 与类型约束
-
-### Changed
-
-- 包名从 `sqlo` 改为 scoped 包名 **`@chaeco/sqlo`**（package.json / package-lock.json / 两份 README 同步更新）
-- README 完整重写：对齐实际 API，覆盖 Quick start / schema / CRUD / 查询构造器 / 迁移 / 异步封装 / 原始访问 / 设计原则
-
-### Fixed
-
-- 修复 `node:sqlite` 返回 null-prototype 行对象导致的 `deepEqual` 断言失败与 DX 问题（ORM 层归一化为普通对象）
-- 修复 LIMIT / OFFSET 未参数化的问题（改为绑定参数）
-- 修复可空列无法显式插入 `null` 的类型缺陷（`InsertOf` 类型联合包含 `null`）
-- 修复 Node 24 下 `node --test` 不接受目录路径的问题（改用 glob）
-- 修复 `run()` 结果 `changes` / `lastInsertRowid` 为 `number | bigint` 的强制转换
-- **修复 `having()` 生成 `WHERE` 而非 `HAVING` 的问题**（`#buildWhereClauses` 现支持关键字参数）
-- 修复示例项目 `examples/basic` 的 `node:*` 类型解析（本地安装 `@types/node` + tsconfig 显式 `types: ["node"]`）
-- **`insertMany()` 改为原子事务**（`Executor` 新增可选 `transaction`，Sqlo 实现；支持在外层事务中通过 SAVEPOINT 嵌套）——修复批量插入半写入问题
-- **`migrate()` 支持在外层 `transaction()` 内运行**（复用 `#txDepth` 走 SAVEPOINT，不再裸 `BEGIN` 冲突）
-- **`schemaDiff()` 检测表级选项变更**（`strict` / `withoutRowId` / 表级 `checks` 变化加入 warnings）
-- **`first()` / `pluck()` 不再污染 builder 状态**（终结操作在状态副本上进行，builder 可复用）
-- `AsyncSqlo.run()` 返回类型与同步版统一（`changes: number | bigint`）
-- `Model.exists()` 改用 `LIMIT 1` 查询，大表性能更优

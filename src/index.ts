@@ -9,6 +9,10 @@ export type { SqloOptions, MigrateOptions } from './core/sqlo.ts';
 export { MultiSqlo } from './core/multi-sqlo.ts';
 export type { MultiSqloOptions } from './core/multi-sqlo.ts';
 
+export { isBusyError, isConstraintError, SQLITE } from './core/error.ts';
+export type { SqliteErrorLike } from './core/error.ts';
+export type { LogEntry, LogEvent, LogLevel } from './core/logging.ts';
+
 export { Model } from './model/model.ts';
 export { QueryBuilder } from './query/query-builder.ts';
 

@@ -64,15 +64,45 @@ export class Model {
      * When called inside an outer `db.transaction(...)`, this nests via
      * SAVEPOINT and participates in the outer commit/rollback.
      */
-    insertMany(rows) {
+    /**
+     * Insert multiple rows and return the inserted rows (with generated ids).
+     * Wrapped in a transaction when the executor supports it (Sqlo does).
+     * When called inside an outer `db.transaction(...)`, this nests via
+     * SAVEPOINT and participates in the outer commit/rollback.
+     *
+     * For very large batches, pass `{ chunkSize }` to insert in chunks — each
+     * chunk gets its own transaction (when not already inside an outer
+     * transaction), keeping write-lock hold time and memory bounded. Errors
+     * within a chunk roll back only that chunk; previously committed chunks
+     * stay.
+     *
+     * @example
+     * model.insertMany(rows, { chunkSize: 1000 });
+     */
+    insertMany(rows, options) {
         if (rows.length === 0)
             return [];
+        const chunkSize = options?.chunkSize ?? rows.length;
         const tx = this.#exec.transaction;
-        if (tx) {
-            // Method-form call keeps `this` bound to the executor (Sqlo).
-            return tx.call(this.#exec, () => rows.map((r) => this.insert(r)));
+        const results = [];
+        if (chunkSize >= rows.length) {
+            // Single batch — keep the existing atomic behaviour.
+            if (tx) {
+                return tx.call(this.#exec, () => rows.map((r) => this.insert(r)));
+            }
+            return rows.map((r) => this.insert(r));
         }
-        return rows.map((r) => this.insert(r));
+        for (let i = 0; i < rows.length; i += chunkSize) {
+            const chunk = rows.slice(i, i + chunkSize);
+            if (tx) {
+                const inserted = tx.call(this.#exec, () => chunk.map((r) => this.insert(r)));
+                results.push(...inserted);
+            }
+            else {
+                results.push(...chunk.map((r) => this.insert(r)));
+            }
+        }
+        return results;
     }
     // ---- SELECT ----
     /**
@@ -154,6 +184,18 @@ export class Model {
         const whereClause = sql.slice(whereIdx);
         const stmt = this.#exec.prepare(`DELETE FROM ${quoteIdent(this.table)}${whereClause}`);
         const result = stmt.run(...params);
+        return Number(result.changes);
+    }
+    /**
+     * Delete all rows in the table. Returns the number of deleted rows.
+     *
+     * Explicit escape hatch — unlike `delete()`, no WHERE is required. Use for
+     * test resets or full-table cleanup. (Deleting all rows never drops the
+     * table or resets AUTOINCREMENT sequences.)
+     */
+    deleteAll() {
+        const stmt = this.#exec.prepare(`DELETE FROM ${quoteIdent(this.table)}`);
+        const result = stmt.run();
         return Number(result.changes);
     }
     // ---- COUNT / EXISTS ----

@@ -5,6 +5,7 @@ import { type DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import type { TableDef, MigrationDef, MigrationStatus, RowOf, InsertOf, PatchOf } from '../schema/types.js';
 import { Model } from '../model/model.js';
 import type { Executor } from '../query/query-builder.js';
+import { type LogEntry, type LogLevel } from './logging.js';
 /**
  * SQLite journal modes for `PRAGMA journal_mode`.
  *
@@ -31,6 +32,20 @@ export interface SqloOptions {
      * `:memory:` databases (they are always in-memory journaling).
      */
     journalMode?: SqliteJournalMode;
+    /**
+     * Behaviour logging window. Provide a callback to observe what Sqlo does —
+     * queries, transactions, schema operations, connection lifecycle. Logging
+     * is opt-in and never affects behaviour.
+     *
+     * @example
+     * new Sqlo({ path: './app.db', onLog: (e) => console.log(e) })
+     */
+    onLog?: (entry: LogEntry) => void;
+    /**
+     * Minimum level emitted through `onLog`. Defaults to `'warn'` (warn + error).
+     * Set to `'debug'` to observe every query.
+     */
+    logLevel?: LogLevel;
 }
 export interface MigrateOptions {
     /**
@@ -63,6 +78,54 @@ export declare class Sqlo implements Executor {
      * Returns the raw `node:sqlite` DatabaseSync instance for direct use.
      */
     raw(): DatabaseSyncType;
+    /**
+     * Whether the underlying database connection is still open.
+     *
+     * Useful for lifecycle management (e.g. checking a cached instance from a
+     * `MultiSqlo` pool, or a worker-owned instance) before using it.
+     */
+    get isOpen(): boolean;
+    /**
+     * The SQLite library version (e.g. `3.46.0`).
+     */
+    get version(): string;
+    /**
+     * All attached databases with their schema name and backing file path.
+     *
+     * The first entry is always `main`. Attached databases (via `attach()`) are
+     * listed after it. In-memory databases (`:memory:`) report an empty file path.
+     *
+     * Rows are normalized to plain objects (node:sqlite returns null-prototype rows).
+     *
+     * @example
+     * db.databaseList()
+     * // → [{ name: 'main', file: '/private/tmp/app.db' },
+     * //    { name: 'audit', file: '/private/tmp/audit.db' }]
+     */
+    databaseList(): Array<{
+        name: string;
+        file: string;
+    }>;
+    /**
+     * Check whether a table exists (optionally in a specific attached schema).
+     *
+     * Lightweight alternative to `reflectTableSchema` when you only need an
+     * existence check — e.g. before `sync()`/`migrate()`, or in setup logic.
+     *
+     * @param name Table name, optionally `schema.table` (e.g. `'audit.logs'`).
+     */
+    tableExists(name: string): boolean;
+    /**
+     * Create an online backup of the current database to another file.
+     *
+     * Uses SQLite's `VACUUM INTO` (available since SQLite 3.27), which takes a
+     * consistent snapshot even while the database is in use. The target path is
+     * parameter-bound. Useful for pre-migration snapshots, scheduled backups, or
+     * per-user backups in a `MultiSqlo` setup.
+     *
+     * @param target File path of the backup to create.
+     */
+    backup(target: string): void;
     /**
      * Execute a SQL string directly (no parameter binding).
      */
@@ -102,8 +165,22 @@ export declare class Sqlo implements Executor {
      *   db.exec('INSERT ...');
      * });
      * ```
+     *
+     * Production concurrency: SQLite is single-writer, so concurrent writers can
+     * hit `SQLITE_BUSY`. Pass `{ retry: n }` to automatically re-run the whole
+     * transaction (from a fresh `BEGIN`) with exponential backoff when the
+     * database is locked. Other errors propagate immediately. Retries only apply
+     * to top-level transactions — a nested (SAVEPOINT) transaction belongs to an
+     * outer one and is never retried.
+     *
+     * @example
+     * db.transaction(() => {
+     *   orders.insert({ ... });
+     * }, { retry: 5 });
      */
-    transaction<T>(fn: () => T): T;
+    transaction<T>(fn: () => T, options?: {
+        retry?: number;
+    }): T;
     /**
      * Attach another SQLite database file to this connection.
      *

@@ -169,4 +169,16 @@ describe('loadMigrations (async)', () => {
     const migrations = await loadMigrations(tmpDir);
     assert.deepEqual(migrations, []);
   });
+
+  it('loads a single object export (not an array) from a .cjs migration', async () => {
+    writeFileSync(
+      join(tmpDir, 'single.cjs'),
+      'module.exports = { name: "single", up: () => {} };',
+    );
+    const migrations = await loadMigrations(tmpDir);
+    assert.deepEqual(
+      migrations.map((m) => m.name),
+      ['single'],
+    );
+  });
 });

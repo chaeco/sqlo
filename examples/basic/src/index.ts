@@ -256,6 +256,32 @@ console.log('\nMultiSqlo: alice 笔记数', aliceNotes.count(), '| bob 笔记数
 pool.closeAll();
 
 // ---------------------------------------------------------------------------
+// 7g. 生产能力 — 错误分类 / 事务重试 / 内省 / 在线备份
+// ---------------------------------------------------------------------------
+
+const prodDb = new Sqlo({ path: join(mkdtempSync(join(tmpdir(), 'sqlo-ex-')), 'prod.db') });
+prodDb.exec('CREATE TABLE IF NOT EXISTS logs (id INTEGER PRIMARY KEY, msg TEXT)');
+console.log('\nisOpen:', prodDb.isOpen, '| version:', prodDb.version, '| tableExists(logs):', prodDb.tableExists('logs'));
+console.log('databaseList:', JSON.stringify(prodDb.databaseList()));
+
+// 在线备份（VACUUM INTO）
+const backupPath = join(mkdtempSync(join(tmpdir(), 'sqlo-ex-')), 'backup.db');
+prodDb.backup(backupPath);
+const bk = new Sqlo({ path: backupPath });
+console.log('backup 可独立打开:', bk.tableExists('logs'));
+bk.close();
+
+// 错误分类 + 事务重试（持锁时自动重试）
+const prodHolder = new Sqlo({ path: prodDb.databaseList()[0]!.file });
+prodHolder.raw().exec('BEGIN IMMEDIATE');
+prodHolder.close(); // 关闭会 ROLLBACK，释放锁
+prodDb.transaction(() => {
+  prodDb.exec('INSERT INTO logs (msg) VALUES (\'tx\')');
+}, { retry: 3 });
+console.log('transaction(retry) 提交成功, 行数:', prodDb.all('SELECT COUNT(*) c FROM logs')[0]!.c);
+prodDb.close();
+
+// ---------------------------------------------------------------------------
 // 8. raw 逃生舱 — 直接访问 node:sqlite DatabaseSync
 // ---------------------------------------------------------------------------
 

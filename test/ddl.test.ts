@@ -37,6 +37,13 @@ describe('columnDDL', () => {
       /cannot contain bound parameters/,
     );
   });
+
+  it('rejects bound params in DEFAULT fragment', () => {
+    assert.throws(
+      () => columnDDL({ type: 'TEXT', default: sql`coalesce(${'x'})` }),
+      /cannot contain bound parameters/,
+    );
+  });
 });
 
 describe('tableDDL', () => {

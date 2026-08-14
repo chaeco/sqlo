@@ -79,3 +79,25 @@ describe('isIdent', () => {
     assert.equal(isIdent(sql`users`), false);
   });
 });
+
+describe('quoteTable', () => {
+  it('quotes plain table names', () => {
+    assert.equal(quoteTable('users'), '"users"');
+  });
+
+  it('splits a dotted schema.table', () => {
+    assert.equal(quoteTable('audit.logs'), '"audit"."logs"');
+  });
+
+  it('handles an alias via space ("table alias")', () => {
+    assert.equal(quoteTable('users u'), '"users" AS "u"');
+    assert.equal(quoteTable('users AS u'), '"users" AS "u"');
+  });
+});
+
+describe('sql tag misuse', () => {
+  it('throws when called as a plain function, not a tagged template', () => {
+    // @ts-expect-error — intentional misuse
+    assert.throws(() => sql('SELECT 1'), /tagged template/i);
+  });
+});

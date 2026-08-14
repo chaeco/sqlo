@@ -40,3 +40,36 @@ test('journalMode: DELETE mode is a no-op (SQLite default)', () => {
   assert.equal(db.raw().prepare('PRAGMA journal_mode').get()?.journal_mode, 'memory');
   db.close();
 });
+
+test('busyTimeout sets PRAGMA busy_timeout on open', () => {
+  const db = new Sqlo({ path: ':memory:', busyTimeout: 2500 });
+  assert.equal(db.raw().prepare('PRAGMA busy_timeout').get()?.timeout, 2500);
+  db.close();
+});
+
+test('define rejects a missing table name', () => {
+  const db = new Sqlo({ path: ':memory:' });
+  assert.throws(
+    () => db.define({ name: '', columns: { id: { type: 'INTEGER' } } }),
+    /Table name is required/,
+  );
+  db.close();
+});
+
+test('define rejects an invalid table name', () => {
+  const db = new Sqlo({ path: ':memory:' });
+  assert.throws(
+    () => db.define({ name: 'bad name!', columns: { id: { type: 'INTEGER' } } }),
+    /Invalid table name/,
+  );
+  db.close();
+});
+
+test('define rejects a schema with no columns', () => {
+  const db = new Sqlo({ path: ':memory:' });
+  assert.throws(
+    () => db.define({ name: 'empty', columns: {} }),
+    /At least one column is required/,
+  );
+  db.close();
+});

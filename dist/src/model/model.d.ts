@@ -34,7 +34,24 @@ export declare class Model<Row extends Record<string, unknown>, Insert, Patch> {
      * When called inside an outer `db.transaction(...)`, this nests via
      * SAVEPOINT and participates in the outer commit/rollback.
      */
-    insertMany(rows: Insert[]): Row[];
+    /**
+     * Insert multiple rows and return the inserted rows (with generated ids).
+     * Wrapped in a transaction when the executor supports it (Sqlo does).
+     * When called inside an outer `db.transaction(...)`, this nests via
+     * SAVEPOINT and participates in the outer commit/rollback.
+     *
+     * For very large batches, pass `{ chunkSize }` to insert in chunks — each
+     * chunk gets its own transaction (when not already inside an outer
+     * transaction), keeping write-lock hold time and memory bounded. Errors
+     * within a chunk roll back only that chunk; previously committed chunks
+     * stay.
+     *
+     * @example
+     * model.insertMany(rows, { chunkSize: 1000 });
+     */
+    insertMany(rows: Insert[], options?: {
+        chunkSize?: number;
+    }): Row[];
     /**
      * Find a row by its primary key (first primaryKey column).
      * Accepts number / bigint for INTEGER keys and string for TEXT/UUID keys.
@@ -63,6 +80,14 @@ export declare class Model<Row extends Record<string, unknown>, Insert, Patch> {
      * The `where` argument is required.
      */
     delete(where: WhereExpr<Partial<Row>> | SqlFragment): number;
+    /**
+     * Delete all rows in the table. Returns the number of deleted rows.
+     *
+     * Explicit escape hatch — unlike `delete()`, no WHERE is required. Use for
+     * test resets or full-table cleanup. (Deleting all rows never drops the
+     * table or resets AUTOINCREMENT sequences.)
+     */
+    deleteAll(): number;
     /**
      * Count rows matching the optional condition.
      */
