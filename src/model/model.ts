@@ -179,18 +179,14 @@ export class Model<Row extends Record<string, unknown>, Insert, Patch> {
 
     const qb = new QueryBuilder<Row>(this.#exec, this.table);
     qb.where(where as WhereExpr<Row>);
-    const { sql, params } = qb.toSql();
-
-    // Extract WHERE clause from the full SELECT
-    const whereIdx = sql.indexOf(' WHERE ');
-    if (whereIdx < 0) {
+    const { clause, params } = qb.buildWhere();
+    if (!clause) {
       throw new Error(
         'update() requires a WHERE condition. Use db.exec() for bulk updates.',
       );
     }
-    const whereClause = sql.slice(whereIdx);
 
-    const updateSql = `UPDATE ${quoteIdent(this.table)} SET ${setClause}${whereClause}`;
+    const updateSql = `UPDATE ${quoteIdent(this.table)} SET ${setClause}${clause}`;
     const stmt = this.#exec.prepare(updateSql);
     const result = stmt.run(...patchValues, ...params);
     return Number(result.changes);
@@ -205,17 +201,14 @@ export class Model<Row extends Record<string, unknown>, Insert, Patch> {
   delete(where: WhereExpr<Partial<Row>> | SqlFragment): number {
     const qb = new QueryBuilder<Row>(this.#exec, this.table);
     qb.where(where as WhereExpr<Row>);
-    const { sql, params } = qb.toSql();
-
-    const whereIdx = sql.indexOf(' WHERE ');
-    if (whereIdx < 0) {
+    const { clause, params } = qb.buildWhere();
+    if (!clause) {
       throw new Error(
         'delete() requires a WHERE condition. Use db.exec() for bulk deletes.',
       );
     }
-    const whereClause = sql.slice(whereIdx);
 
-    const stmt = this.#exec.prepare(`DELETE FROM ${quoteIdent(this.table)}${whereClause}`);
+    const stmt = this.#exec.prepare(`DELETE FROM ${quoteIdent(this.table)}${clause}`);
     const result = stmt.run(...params);
     return Number(result.changes);
   }

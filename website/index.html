@@ -85,6 +85,29 @@
       </div>
     </section>
 
+    <script type="application/json" id="terminalSteps">
+    [
+      {
+        "code": "const adults = users\n  .query()\n  .where({ age: { gte: 18 } })\n  .orderBy('age', 'DESC')\n  .all();",
+        "sql":    "SELECT * FROM \"users\" WHERE \"age\" >= ? ORDER BY \"age\" DESC",
+        "params": "[18]",
+        "result": "[\n  { id: 3, name: \"carol\", age: 35 },\n  { id: 1, name: \"alice\", age: 30 },\n  { id: 4, name: \"dave\", age: 21 }\n]"
+      },
+      {
+        "code": "const row = users.findOne({ email: 'a@x.io' });",
+        "sql":    "SELECT * FROM \"users\" WHERE \"email\" = ? LIMIT 1",
+        "params": "['a@x.io']",
+        "result": "{ id: 1, name: \"alice\", email: \"a@x.io\", age: 30 }"
+      },
+      {
+        "code": "const n = users.update(\n  { age: 31 },\n  { name: 'alice' },\n);",
+        "sql":    "UPDATE \"users\" SET \"age\" = ? WHERE \"name\" = ?",
+        "params": "[31, \"alice\"]",
+        "result": "changes: 1"
+      }
+    ]
+    </script>
+
     <!-- ── 事实带：真实数字 ───────────────────────────────── -->
     <section class="facts" aria-label="Sqlo 关键事实">
       <div class="facts__inner">

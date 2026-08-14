@@ -655,6 +655,12 @@ export class Sqlo implements Executor {
     if (this.#closed) {
       throw new Error('Database is closed.');
     }
+    if (!this.#db.isOpen) {
+      // The raw connection may have been closed out-of-band via `raw()`;
+      // surface a clear error instead of letting node:sqlite throw opaque
+      // "database is not open" errors from an unexpected layer.
+      throw new Error('Database connection is not open.');
+    }
   }
 
   #migrationTableRef(schema: string): string {

@@ -1,5 +1,5 @@
 /* ==========================================================================
-   Sqlo — website interactions & animation
+   Chaeco — unified project website interactions & animation
    Zero-dependency, plain JS. Respects prefers-reduced-motion.
    ========================================================================== */
 
@@ -9,30 +9,11 @@
   const REDUCED = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   /* ------------------------------------------------------------------ *
-   * 活终端：循环演示一条 Sqlo 查询
+   * 活终端：循环演示（steps 定义在 HTML 的 <script type="application/json"> 中）
    * ------------------------------------------------------------------ */
 
-  const terminalSteps = [
-    {
-      code: "const adults = users\n  .query()\n  .where({ age: { gte: 18 } })\n  .orderBy('age', 'DESC')\n  .all();",
-      // 彩色输出由 HTML 模板注入（值用 textContent，防止注入）
-      sql:    'SELECT * FROM "users" WHERE "age" >= ? ORDER BY "age" DESC',
-      params: '[18]',
-      result: '[\n  { id: 3, name: "carol", age: 35 },\n  { id: 1, name: "alice", age: 30 },\n  { id: 4, name: "dave", age: 21 }\n]',
-    },
-    {
-      code: "const row = users.findOne({ email: 'a@x.io' });",
-      sql:    'SELECT * FROM "users" WHERE "email" = ? LIMIT 1',
-      params: "['a@x.io']",
-      result: '{ id: 1, name: "alice", email: "a@x.io", age: 30 }',
-    },
-    {
-      code: "const n = users.update(\n  { age: 31 },\n  { name: 'alice' },\n);",
-      sql:    'UPDATE "users" SET "age" = ? WHERE "name" = ?',
-      params: '[31, "alice"]',
-      result: 'changes: 1',
-    },
-  ];
+  const stepsJson = document.getElementById('terminalSteps');
+  const terminalSteps = stepsJson ? JSON.parse(stepsJson.textContent) : [];
 
   const codeEl = document.getElementById('terminalCode');
   const sqlEl  = document.getElementById('termSql');
@@ -127,23 +108,25 @@
 
   // 点击终端重跑当前步
   const terminal = document.querySelector('.terminal');
-  terminal.addEventListener('click', () => {
-    if (REDUCED) return;
-    cancelAnimationFrame(rafId);
-    prepOutput();
-    playStep(terminalSteps[stepIdx], () => {
-      setTimeout(loop, 2600);
+  if (terminal && terminalSteps.length) {
+    terminal.addEventListener('click', () => {
+      if (REDUCED) return;
+      cancelAnimationFrame(rafId);
+      prepOutput();
+      playStep(terminalSteps[stepIdx], () => {
+        setTimeout(loop, 2600);
+      });
     });
-  });
 
-  // 启动
-  prepOutput();
-  if (REDUCED) {
-    setOutput(terminalSteps[0]);
-  } else {
-    // 首步：展示第一条查询，再进入循环
-    stepIdx = -1;
-    loop();
+    // 启动
+    prepOutput();
+    if (REDUCED) {
+      setOutput(terminalSteps[0]);
+    } else {
+      // 首步：展示第一条查询，再进入循环
+      stepIdx = -1;
+      loop();
+    }
   }
 
   /* ------------------------------------------------------------------ *
@@ -242,17 +225,19 @@
 
   // Tab 键盘方向键支持
   const tabList = document.querySelector('.demo__tabs');
-  tabList.addEventListener('keydown', (e) => {
-    const current = Array.from(tabs).findIndex((t) => t === document.activeElement);
-    if (current < 0) return;
-    let next = current;
-    if (e.key === 'ArrowRight') next = (current + 1) % tabs.length;
-    else if (e.key === 'ArrowLeft') next = (current - 1 + tabs.length) % tabs.length;
-    else return;
-    e.preventDefault();
-    tabs[next].focus();
-    tabs[next].click();
-  });
+  if (tabList) {
+    tabList.addEventListener('keydown', (e) => {
+      const current = Array.from(tabs).findIndex((t) => t === document.activeElement);
+      if (current < 0) return;
+      let next = current;
+      if (e.key === 'ArrowRight') next = (current + 1) % tabs.length;
+      else if (e.key === 'ArrowLeft') next = (current - 1 + tabs.length) % tabs.length;
+      else return;
+      e.preventDefault();
+      tabs[next].focus();
+      tabs[next].click();
+    });
+  }
 
   /* ------------------------------------------------------------------ *
    * 导航：滚动后加一点阴影

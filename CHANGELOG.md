@@ -5,7 +5,16 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.3.1] - 2026-08-14
+
+### Fixed
+
+- **`Model.update()` / `Model.delete()` 不再字符串截取** — 两个方法此前通过 `sql.indexOf(' WHERE ')` 从完整 SELECT 中切片提取 WHERE 子句；`QueryBuilder` 现暴露公开的 `buildWhere()` 返回 `{ clause, params }`，Model 直接复用，彻底消除条件中包含 `" WHERE "` 子串时的截取风险。
+- **`#ensureOpen()` 与 `raw()` 逃生舱一致** — 现在同时检查底层 `DatabaseSync.isOpen`。若用户通过 `db.raw().close()` 在外部关闭连接，后续调用会抛出清晰的 "Database connection is not open." 而非 node:sqlite 的原生晦涩错误。
+
+### Changed
+
+- **网站对齐统一模板** — `website/` 落地页同步为 Chaeco 统一深色终端模板，终端演示改为 JSON 配置驱动（`#terminalSteps`），风格与其余项目完全一致。
 
 ## [0.3.0] - 2026-08-14
 

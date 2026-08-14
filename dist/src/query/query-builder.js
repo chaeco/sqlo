@@ -135,6 +135,20 @@ export class QueryBuilder {
     }
     // ---- Build SQL ----
     /**
+     * Build only the WHERE clause (with params) for the current query state.
+     * Returns `{ clause, params }` where `clause` is the full
+     * `WHERE ...` fragment (or `''` when no conditions were added).
+     *
+     * Used by `Model#update` / `Model#delete` to compose UPDATE/DELETE
+     * statements without re-parsing a complete SELECT — avoids fragile
+     * string slicing on the compiled SQL.
+     */
+    buildWhere() {
+        const params = [];
+        const clause = this.#buildWhereClauses(this.#s.whereGroups, params);
+        return { clause, params };
+    }
+    /**
      * Returns the compiled SQL string and bound parameters.
      */
     toSql() {
