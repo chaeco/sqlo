@@ -801,3 +801,114 @@ code, pre {
 
   .backdrop__grid { animation: none; }
 }
+
+/* ── 架构章节 ──────────────────────────────────────────────────────────── */
+
+.arch {
+  border-top: 1px solid var(--line);
+}
+
+.arch__figure {
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: color-mix(in srgb, var(--bg-surface) 60%, transparent);
+  padding: 24px;
+  margin-bottom: 24px;
+  overflow-x: auto;
+}
+
+.arch__fig-title {
+  font-family: var(--font-display);
+  font-size: 1.02rem;
+  font-weight: 600;
+  margin: 0 0 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.arch__tag {
+  font-family: var(--font-mono);
+  font-size: 0.62rem;
+  font-weight: 500;
+  color: var(--accent-data);
+  border: 1px solid rgba(34, 211, 238, 0.4);
+  border-radius: 999px;
+  padding: 2px 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  animation: tag-pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes tag-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(34, 211, 238, 0.25); }
+  50%      { box-shadow: 0 0 0 5px rgba(34, 211, 238, 0); }
+}
+
+.arch__svg {
+  width: 100%;
+  height: auto;
+  min-width: 640px;
+  display: block;
+}
+
+/* 层间流动连线：双向青色虚线流动 */
+.arch-flow__line {
+  stroke: var(--accent-data);
+  stroke-width: 2;
+  stroke-dasharray: 7 7;
+  animation: dash-flow 1.1s linear infinite;
+}
+
+.arch-flow__line--reverse {
+  animation-direction: reverse;
+  animation-duration: 1.5s;
+  opacity: 0.55;
+}
+
+@keyframes dash-flow {
+  to { stroke-dashoffset: -14; }
+}
+
+/* 组件 hover 高亮 */
+.arch-module,
+.arch-layer rect,
+.flow-step rect {
+  transition: filter 0.3s, transform 0.3s var(--ease-out);
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.arch-module:hover rect {
+  filter: brightness(1.45);
+  transform: scale(1.04);
+}
+
+.arch-layer:hover rect {
+  filter: brightness(1.3);
+}
+
+/* 流程线：青色流动 + 箭头 */
+.flow-lines line {
+  stroke: var(--accent-data);
+  stroke-width: 2;
+  stroke-dasharray: 6 6;
+  animation: dash-flow 0.9s linear infinite;
+}
+
+/* 数据点移动：在流程线上方穿越（SMIL animateMotion） */
+.flow-step rect {
+  transition: filter 0.3s, transform 0.3s var(--ease-out);
+  transform-box: fill-box;
+  transform-origin: center;
+}
+
+.flow-step:hover rect {
+  filter: brightness(1.5);
+  transform: scale(1.05);
+}
+
+/* 数据点发光 */
+svg circle[fill="#22d3ee"] {
+  filter: drop-shadow(0 0 6px rgba(34, 211, 238, 0.8));
+}
