@@ -37,8 +37,10 @@ export type RefAction =
   | 'RESTRICT'
   | 'NO ACTION';
 
-export interface ColumnDef<T extends string = string> {
-  /** SQLite column type (e.g. 'INTEGER', 'TEXT', 'REAL', 'BLOB', 'NUMERIC') */
+export type SqliteType = keyof TypeToJs;
+
+export interface ColumnDef<T extends string = SqliteType> {
+  /** SQLite column type (e.g. 'INTEGER', 'TEXT', 'REAL', 'BLOB', 'NUMERIC'). Any SQLite type name is allowed (type affinity), but known names are constrained by `SqliteType` for typo protection. */
   type: T;
   primaryKey?: boolean;
   autoIncrement?: boolean;
@@ -70,7 +72,7 @@ export interface IndexDef {
   where?: SqlFragment | string;
 }
 
-export interface TableDef<C extends Record<string, ColumnDef> = Record<string, ColumnDef>> {
+export interface TableDef<C extends Record<string, ColumnDef<string>> = Record<string, ColumnDef<string>>> {
   name: string;
   columns: C;
   indexes?: readonly IndexDef[];
@@ -113,7 +115,7 @@ export interface TypeToJs {
   TIMESTAMP: string;
 }
 
-export type ColumnValue<D extends ColumnDef> =
+export type ColumnValue<D extends ColumnDef<string>> =
   D['type'] extends keyof TypeToJs
     ? TypeToJs[D['type']]
     : string;
@@ -122,7 +124,7 @@ export type ColumnValue<D extends ColumnDef> =
 // Nullability helpers
 // ---------------------------------------------------------------------------
 
-type IsNullable<D extends ColumnDef> =
+type IsNullable<D extends ColumnDef<string>> =
   D['notNull'] extends true ? false
   : D['primaryKey'] extends true ? false
   : D['autoIncrement'] extends true ? false
@@ -131,7 +133,7 @@ type IsNullable<D extends ColumnDef> =
 type HasProp<O, K extends PropertyKey> =
   K extends keyof O ? true : false;
 
-type IsRequiredInInput<D extends ColumnDef> =
+type IsRequiredInInput<D extends ColumnDef<string>> =
   D['autoIncrement'] extends true ? false
   : D['primaryKey'] extends true ? (D['autoIncrement'] extends true ? false : true)
   : IsNullable<D> extends true ? false
@@ -142,12 +144,12 @@ type IsRequiredInInput<D extends ColumnDef> =
 // Row, Insert, Patch type inference
 // ---------------------------------------------------------------------------
 
-type ColumnRowValue<D extends ColumnDef> =
+type ColumnRowValue<D extends ColumnDef<string>> =
   IsNullable<D> extends true
     ? ColumnValue<D> | null
     : ColumnValue<D>;
 
-type ColumnPatchValue<D extends ColumnDef> =
+type ColumnPatchValue<D extends ColumnDef<string>> =
   IsNullable<D> extends true
     ? ColumnValue<D> | null | undefined
     : ColumnValue<D> | undefined;

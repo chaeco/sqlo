@@ -5,6 +5,17 @@ import { type DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 import type { TableDef, MigrationDef, MigrationStatus, RowOf, InsertOf, PatchOf } from '../schema/types.js';
 import { Model } from '../model/model.js';
 import type { Executor } from '../query/query-builder.js';
+/**
+ * SQLite journal modes for `PRAGMA journal_mode`.
+ *
+ * - `DELETE` (default) — rollback journal deleted after each commit
+ * - `TRUNCATE` — journal truncated instead of deleted (fewer fsyncs)
+ * - `PERSIST` — journal header zeroed, file kept
+ * - `MEMORY` — journal kept in memory (fast, crash-unsafe)
+ * - `WAL` — write-ahead log (readers don't block the writer)
+ * - `OFF` — no journaling (largest risk of database corruption)
+ */
+export type SqliteJournalMode = 'DELETE' | 'TRUNCATE' | 'PERSIST' | 'MEMORY' | 'WAL' | 'OFF';
 export interface SqloOptions {
     path?: string;
     open?: boolean;
@@ -13,6 +24,13 @@ export interface SqloOptions {
     enableDoubleQuotedStringLiterals?: boolean;
     allowExtension?: boolean;
     busyTimeout?: number;
+    /**
+     * Journal mode applied via `PRAGMA journal_mode` on open.
+     * Defaults to SQLite's own default (`DELETE`). Use `'WAL'` for concurrent
+     * read/write workloads; WAL is persistent on file databases but a no-op on
+     * `:memory:` databases (they are always in-memory journaling).
+     */
+    journalMode?: SqliteJournalMode;
 }
 export interface MigrateOptions {
     /**

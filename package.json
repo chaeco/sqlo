@@ -1,6 +1,6 @@
 {
   "name": "@chaeco/sqlo",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Lightweight, SQLite-only ORM built on Node.js built-in node:sqlite. Zero native dependencies.",
   "type": "module",
   "main": "./dist/src/index.js",

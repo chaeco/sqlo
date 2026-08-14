@@ -12,7 +12,7 @@ import type { ColumnDef, TableDef } from './types.js';
  * @returns A fragment like `TEXT NOT NULL DEFAULT 'draft'` or
  *   `INTEGER PRIMARY KEY AUTOINCREMENT`.
  */
-export declare function columnDDL(col: ColumnDef): string;
+export declare function columnDDL(col: ColumnDef<string>): string;
 /**
  * Generate a `CREATE TABLE IF NOT EXISTS` statement from a table definition.
  * Columns, table-level CHECK constraints, `STRICT` and `WITHOUT ROWID`

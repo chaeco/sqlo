@@ -18,5 +18,5 @@ export { reflectTableSchema } from './schema/reflect.js';
 export { loadTableDefSync } from './schema/json.js';
 export { loadMigrations, loadMigrationsSync } from './migration/migration.js';
 export { AsyncSqlo } from './async/async.js';
-export type { ColumnDef, TableDef, IndexDef, RefAction, SqlOptions, TypeToJs, ColumnValue, RowOf, InsertOf, PatchOf, WhereOps, WhereValue, WhereExpr, OrderDir, MigrationDef, MigrationStatus, } from './schema/types.js';
+export type { ColumnDef, TableDef, IndexDef, RefAction, SqliteType, SqlOptions, TypeToJs, ColumnValue, RowOf, InsertOf, PatchOf, WhereOps, WhereValue, WhereExpr, OrderDir, MigrationDef, MigrationStatus, } from './schema/types.js';
 //# sourceMappingURL=index.d.ts.map

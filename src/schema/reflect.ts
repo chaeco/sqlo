@@ -55,6 +55,14 @@ interface PRAGMA_IndexInfo {
  * best read from your schema files / migrations instead.
  */
 export function reflectTableSchema(exec: Executor, table: string): TableDef {
+  const result = reflectRaw(exec, table);
+  // Reflected column types come from PRAGMA at runtime and cannot be
+  // statically verified against `SqliteType` — cast to the public `TableDef`.
+  return result as TableDef;
+}
+
+/** Runtime implementation of `reflectTableSchema` with broad column typing. */
+function reflectRaw(exec: Executor, table: string): TableDef<Record<string, ColumnDef<string>>> {
   // Split "schema.table" (attached database) from a bare "table" name.
   const parts = table.split('.');
   const schema = parts.length === 2 ? parts[0]! : 'main';
@@ -74,9 +82,9 @@ export function reflectTableSchema(exec: Executor, table: string): TableDef {
 
   // ---- Columns ----
   const colRows = exec.prepare(`PRAGMA ${schemaIdent}.table_info(${tableIdent})`).all() as unknown as PRAGMA_TableInfo[];
-  const columns: Record<string, ColumnDef> = {};
+  const columns: Record<string, ColumnDef<string>> = {};
   for (const col of colRows) {
-    const def: ColumnDef = {
+    const def: ColumnDef<string> = {
       type: col.type || 'TEXT', // SQLite reports '' for typeless columns
     };
     if (col.pk > 0) def.primaryKey = true;

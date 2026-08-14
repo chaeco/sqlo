@@ -7,7 +7,12 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-14
+
 ### Added
+
+- **`journalMode` 连接选项**（`SqloOptions`）：`'WAL'` / `'DELETE'` / `'TRUNCATE'` / `'PERSIST'` / `'MEMORY'` / `'OFF'`，构造器自动执行 `PRAGMA journal_mode`（WAL 持久化到库文件），与 `busyTimeout` 同为常用连接设置的一等公民
+- **`SqliteType` 类型约束**（`src/schema/types.ts`）：`ColumnDef` 默认约束为已知 SQLite 类型名（拼错编译期提示），同时 `TableDef` 允许自定义类型名（SQLite 类型亲和，如 `UUID` / `JSON` / `VARCHAR(255)`），运行时对非标准类型名发一次性 `SQLO_SCHEMA_WARNING` 警告而非报错
 
 - **Sqlo 核心类**（`src/core/sqlo.ts`）
   - 基于 Node.js 内置 `node:sqlite` 的 `DatabaseSync` 薄封装，零第三方原生依赖
@@ -102,9 +107,11 @@
   - `node:*` 内置模块一律静态导入，禁止 `await import('node:fs/promises')` 动态导入（`loadMigrations` 已改为顶层静态导入）
   - **`dist/src` 构建产物提交到仓库**：JS 项目可直接 `npm install github:chaeco/sqlo` 或 clone 后使用，无需构建步骤（`dist/test` 为测试编译产物，不入库）
   - **GitHub Actions 三套 workflow**：`ci.yml`（测试矩阵）、`pages.yml`（website 变更自动部署 GitHub Pages）、`publish.yml`（`v*` tag 触发 npm 发布）
-  - **142 个单元测试**（`node --test`）覆盖全部核心模块，包括 `AsyncSqlo` worker 封装、JSON 表结构、schema 差异分析/内省、多数据库与附加库迁移、多用户隔离
-  - **示例项目**（`examples/basic/`）：独立可运行的 TS 项目，演示 SQL 迁移 / schema / CRUD / 查询构造器 / 联表 / 事务 / raw / JSON 表结构 / schema 演进与内省 / 多数据库 / 多用户隔离
+  - **示例项目**（`examples/basic/`）：独立可运行的 TS 项目，演示 SQL 迁移 / schema / CRUD / 查询构造器 / 联表 / 事务 / raw / JSON 表结构 / schema 演进与内省 / 多数据库（含 `journalMode: 'WAL'`）/ 多用户隔离
   - 英文 README + 中文 README（`README.zh-CN.md`）+ CHANGELOG 文档体系，含完整 API 参考
+  - **`journalMode` 连接选项**（`SqloOptions`）：`'WAL'` / `'DELETE'` / `'TRUNCATE'` / `'PERSIST'` / `'MEMORY'` / `'OFF'`，构造器自动执行 `PRAGMA journal_mode`（WAL 持久化到库文件），与 `busyTimeout` 同为常用连接设置的一等公民
+  - **`SqliteType` 类型约束**（`src/schema/types.ts`）：`ColumnDef` 默认约束为已知 SQLite 类型名（拼错编译期提示），同时 `TableDef` 允许自定义类型名（SQLite 类型亲和，如 `UUID` / `JSON` / `VARCHAR(255)`），运行时对非标准类型名发一次性 `SQLO_SCHEMA_WARNING` 警告而非报错
+  - **150 个单元测试**（`node --test`）覆盖全部核心模块，包括 `AsyncSqlo` worker 封装、JSON 表结构、schema 差异分析/内省、多数据库与附加库迁移、多用户隔离、`journalMode` 与类型约束
 
 ### Changed
 

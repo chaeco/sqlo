@@ -41,7 +41,7 @@ examples/basic/
 | 7   | 事务（失败自动回滚）|
 | 7b  | JSON 表结构（`loadTableDefSync`）|
 | 7c-7d | Schema 演进与内省（`schemaDiff` / `reflectTableSchema`）|
-| 7e  | 多数据库 ATTACH + 附加库迁移 |
+| 7e  | 多数据库 ATTACH + 附加库迁移 + `journalMode: 'WAL'` |
 | 7f  | 多用户隔离（`MultiSqlo`，每用户独立库）|
 | 8   | raw 逃生舱 |
 

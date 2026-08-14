@@ -82,7 +82,7 @@ describe('reflectTableSchema', () => {
         email: { type: 'TEXT', unique: true },
       },
       indexes: [{ name: 'idx_users_name', columns: ['name'] }],
-    };
+    } as const;
     const diff = schemaDiff(actual, desired);
     assert.deepEqual(diff.addedColumns, []);
     assert.deepEqual(diff.removedColumns, []);
@@ -100,7 +100,7 @@ describe('reflectTableSchema', () => {
         name: { type: 'TEXT', notNull: true },
         email: { type: 'TEXT' },
       },
-    };
+    } as const;
     const diff = schemaDiff(actual, desired);
     assert.deepEqual(diff.addedColumns, ['email']);
     assert.ok(diff.statements.some((s) => s.includes('ADD COLUMN "email"')));

@@ -37,7 +37,7 @@ export interface SchemaDiff {
   warnings: string[];
 }
 
-function columnKey(col: ColumnDef): string {
+function columnKey(col: ColumnDef<string>): string {
   // Serialize type + constraints so we can detect meaningful changes while
   // ignoring key ordering. Plain-string CHECK/where are compared by text.
   const chk = col.check;
@@ -70,7 +70,7 @@ function sameIndexes(a: IndexDef, b: IndexDef): boolean {
   return wA === wB;
 }
 
-function hasIncompatibleAddColumn(name: string, col: ColumnDef): string | null {
+function hasIncompatibleAddColumn(name: string, col: ColumnDef<string>): string | null {
   // SQLite's ALTER TABLE ADD COLUMN cannot add PRIMARY KEY / UNIQUE columns.
   if (col.primaryKey || col.unique) {
     return `Column "${name}" cannot be added with ALTER TABLE because it is PRIMARY KEY or UNIQUE. Requires a table-rebuild migration.`;

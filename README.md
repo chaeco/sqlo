@@ -52,6 +52,16 @@ const users = db.define({
   indexes: [{ name: 'idx_users_email', columns: ['email'], unique: true }],
 });
 
+// Connection options (all optional):
+//   path                            : database file path or ':memory:' (default)
+//   enableForeignKeyConstraints     : enforce FK constraints (default true)
+//   busyTimeout                     : busy timeout ms (default 5000)
+//   journalMode                     : 'DELETE'|'TRUNCATE'|'PERSIST'|'MEMORY'|'WAL'|'OFF'
+//                                     e.g. journalMode: 'WAL' — persisted in the db file
+//   readBigInts                     : read INTEGER columns as bigint (default false)
+//   enableDoubleQuotedStringLiterals: passed through to node:sqlite
+//   allowExtension                  : passed through to node:sqlite
+
 // DDL is explicit — the ORM never auto-creates tables.
 users.sync();
 
@@ -600,9 +610,9 @@ separators. You can customize the file naming with a `fileName` option.
 ### Types
 
 `SqloOptions`, `MigrateOptions`, `MultiSqloOptions`, `SchemaDiff`, `TableDef`,
-`ColumnDef`, `IndexDef`, `RefAction`, `RowOf`, `InsertOf`, `PatchOf`,
-`WhereExpr`, `WhereValue`, `WhereOps`, `OrderDir`, `SqlFragment`, `Ident`,
-`MigrationDef`, `MigrationStatus`, `SqlOptions`.
+`ColumnDef`, `IndexDef`, `RefAction`, `SqliteType`, `RowOf`, `InsertOf`,
+`PatchOf`, `WhereExpr`, `WhereValue`, `WhereOps`, `OrderDir`, `SqlFragment`,
+`Ident`, `MigrationDef`, `MigrationStatus`, `SqlOptions`.
 
 ## Design principles
 

@@ -31,6 +31,7 @@ export type {
   TableDef,
   IndexDef,
   RefAction,
+  SqliteType,
   SqlOptions,
 
   TypeToJs,

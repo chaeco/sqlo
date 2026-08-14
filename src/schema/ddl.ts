@@ -59,7 +59,7 @@ function escapeDefaultLiteral(value: unknown): string {
  * @returns A fragment like `TEXT NOT NULL DEFAULT 'draft'` or
  *   `INTEGER PRIMARY KEY AUTOINCREMENT`.
  */
-export function columnDDL(col: ColumnDef): string {
+export function columnDDL(col: ColumnDef<string>): string {
   const parts: string[] = [];
 
   parts.push(col.type.toUpperCase());

@@ -50,7 +50,15 @@ const users = db.define({
   indexes: [{ name: 'idx_users_email', columns: ['email'], unique: true }],
 });
 
-// DDL 是显式的——ORM 永远不会自动建表。
+// 连接选项（均可选）：
+//   path                            : 数据库文件路径或 ':memory:'（默认）
+//   enableForeignKeyConstraints     : 是否强制外键约束（默认 true）
+//   busyTimeout                     : 忙等待超时毫秒数（默认 5000）
+//   journalMode                     : 'DELETE'|'TRUNCATE'|'PERSIST'|'MEMORY'|'WAL'|'OFF'
+//                                     例如 journalMode: 'WAL'——持久化在数据库文件中
+//   readBigInts                     : 将 INTEGER 列读为 bigint（默认 false）
+//   enableDoubleQuotedStringLiterals: 透传给 node:sqlite
+//   allowExtension                  : 透传给 node:sqlite
 users.sync();
 
 // insert 返回完整的、完全类型化的行。
@@ -564,9 +572,9 @@ pool.closeAll();       // 关闭所有已打开的用户库
 ### 类型
 
 `SqloOptions`、`MigrateOptions`、`MultiSqloOptions`、`SchemaDiff`、`TableDef`、
-`ColumnDef`、`IndexDef`、`RefAction`、`RowOf`、`InsertOf`、`PatchOf`、
-`WhereExpr`、`WhereValue`、`WhereOps`、`OrderDir`、`SqlFragment`、`Ident`、
-`MigrationDef`、`MigrationStatus`、`SqlOptions`。
+`ColumnDef`、`IndexDef`、`RefAction`、`SqliteType`、`RowOf`、`InsertOf`、
+`PatchOf`、`WhereExpr`、`WhereValue`、`WhereOps`、`OrderDir`、`SqlFragment`、
+`Ident`、`MigrationDef`、`MigrationStatus`、`SqlOptions`。
 
 ## 设计原则
 

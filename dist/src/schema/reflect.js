@@ -28,6 +28,13 @@ import { quoteIdent } from "../query/sql.js";
  * best read from your schema files / migrations instead.
  */
 export function reflectTableSchema(exec, table) {
+    const result = reflectRaw(exec, table);
+    // Reflected column types come from PRAGMA at runtime and cannot be
+    // statically verified against `SqliteType` — cast to the public `TableDef`.
+    return result;
+}
+/** Runtime implementation of `reflectTableSchema` with broad column typing. */
+function reflectRaw(exec, table) {
     // Split "schema.table" (attached database) from a bare "table" name.
     const parts = table.split('.');
     const schema = parts.length === 2 ? parts[0] : 'main';

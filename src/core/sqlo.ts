@@ -14,6 +14,24 @@ import { quoteIdent } from '../query/sql.ts';
 // SqloOptions
 // ---------------------------------------------------------------------------
 
+/**
+ * SQLite journal modes for `PRAGMA journal_mode`.
+ *
+ * - `DELETE` (default) — rollback journal deleted after each commit
+ * - `TRUNCATE` — journal truncated instead of deleted (fewer fsyncs)
+ * - `PERSIST` — journal header zeroed, file kept
+ * - `MEMORY` — journal kept in memory (fast, crash-unsafe)
+ * - `WAL` — write-ahead log (readers don't block the writer)
+ * - `OFF` — no journaling (largest risk of database corruption)
+ */
+export type SqliteJournalMode =
+  | 'DELETE'
+  | 'TRUNCATE'
+  | 'PERSIST'
+  | 'MEMORY'
+  | 'WAL'
+  | 'OFF';
+
 export interface SqloOptions {
   path?: string;
   open?: boolean;
@@ -22,6 +40,13 @@ export interface SqloOptions {
   enableDoubleQuotedStringLiterals?: boolean;
   allowExtension?: boolean;
   busyTimeout?: number;
+  /**
+   * Journal mode applied via `PRAGMA journal_mode` on open.
+   * Defaults to SQLite's own default (`DELETE`). Use `'WAL'` for concurrent
+   * read/write workloads; WAL is persistent on file databases but a no-op on
+   * `:memory:` databases (they are always in-memory journaling).
+   */
+  journalMode?: SqliteJournalMode;
 }
 
 export interface MigrateOptions {
@@ -71,6 +96,7 @@ export class Sqlo implements Executor {
       enableDoubleQuotedStringLiterals: opts.enableDoubleQuotedStringLiterals ?? false,
       allowExtension: opts.allowExtension ?? false,
       busyTimeout: opts.busyTimeout ?? 0,
+      journalMode: opts.journalMode ?? 'DELETE',
     };
 
     this.#db = new DatabaseSync(path, {
@@ -83,6 +109,9 @@ export class Sqlo implements Executor {
 
     if (this.#options.busyTimeout > 0) {
       this.#db.exec(`PRAGMA busy_timeout = ${this.#options.busyTimeout}`);
+    }
+    if (opts.journalMode !== undefined && opts.journalMode !== 'DELETE') {
+      this.#db.exec(`PRAGMA journal_mode = ${this.#options.journalMode}`);
     }
   }
 
@@ -261,11 +290,14 @@ export class Sqlo implements Executor {
   ): Model<RowOf<S>, InsertOf<S>, PatchOf<S>> {
     this.#ensureOpen();
     // Validate the schema
-    const errors = validateSchema(schema);
+    const { errors, warnings } = validateSchema(schema);
     if (errors.length > 0) {
       throw new Error(
         `Invalid schema for table "${schema.name}":\n  ${errors.join('\n  ')}`,
       );
+    }
+    for (const warning of warnings) {
+      process.emitWarning(warning, { code: 'SQLO_SCHEMA_WARNING' });
     }
 
     // Foreign keys: warn when the schema declares references but the
@@ -471,8 +503,9 @@ function schemaHasReferences(schema: TableDef): boolean {
   return Object.values(schema.columns).some((col) => col.references !== undefined);
 }
 
-function validateSchema(schema: TableDef): string[] {
+function validateSchema(schema: TableDef): { errors: string[]; warnings: string[] } {
   const errors: string[] = [];
+  const warnings: string[] = [];
 
   if (!schema.name) {
     errors.push('Table name is required.');
@@ -493,7 +526,12 @@ function validateSchema(schema: TableDef): string[] {
     if (!col.type) {
       errors.push(`Column "${name}" is missing a "type".`);
     } else if (!VALID_COLUMN_TYPES.has(col.type.toUpperCase())) {
-      errors.push(`Column "${name}" has unrecognized type "${col.type}".`);
+      // SQLite accepts arbitrary type names (type affinity). Follow SQLite's
+      // semantics but warn — a non-standard type name is often a typo.
+      warnings.push(
+        `Column "${name}" has a non-standard type "${col.type}". ` +
+          'SQLite accepts it (type affinity), but ensure this is intentional.',
+      );
     }
 
     if (col.autoIncrement && (!col.primaryKey || col.type.toUpperCase() !== 'INTEGER')) {
@@ -554,5 +592,5 @@ function validateSchema(schema: TableDef): string[] {
     }
   }
 
-  return errors;
+  return { errors, warnings };
 }

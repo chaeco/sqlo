@@ -203,7 +203,12 @@ console.log('\n内省 tags 实际 vs 代码 schema，差异:', JSON.stringify({
 // ---------------------------------------------------------------------------
 
 const auditPath = join(mkdtempSync(join(tmpdir(), 'sqlo-ex-')), 'audit.db');
+
+// journalMode: 文件库可设为 WAL（读写并发更优，持久化到库文件）
+const auditDb = new Sqlo({ path: auditPath, journalMode: 'WAL' });
+console.log('\njournal_mode:', auditDb.raw().prepare('PRAGMA journal_mode').get()!.journal_mode);
 db.attach(auditPath, 'audit');
+auditDb.close();
 const auditLogs = db.define({
   name: 'audit.logs',
   columns: {
