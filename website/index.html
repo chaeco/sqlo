@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Sqlo — 零依赖 · 类型优先 · SQLite-only ORM</title>
+  <meta name="description" content="Sqlo：基于 Node.js 内置 node:sqlite 的轻量 ORM。零第三方原生依赖、纯对象 schema 驱动类型推导、全参数绑定、显式 DDL。" />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到主要内容</a>
+
+  <!-- ── 背景氛围：网格 + 光标 ───────────────────────────── -->
+  <div class="backdrop" aria-hidden="true">
+    <div class="backdrop__grid"></div>
+    <div class="backdrop__glow"></div>
+  </div>
+
+  <!-- ── 导航 ────────────────────────────────────────────── -->
+  <header class="nav">
+    <div class="nav__inner">
+      <a class="brand" href="#top">
+        <span class="brand__mark" aria-hidden="true">&gt;_</span>
+        <span class="brand__name">sqlo</span>
+      </a>
+      <nav class="nav__links" aria-label="页面导航">
+        <a href="#why">为什么</a>
+        <a href="#demo">用法</a>
+        <a href="#honest">边界</a>
+        <a href="#install">安装</a>
+      </nav>
+      <a class="btn btn--solid nav__cta" href="#install">开始使用</a>
+    </div>
+  </header>
+
+  <main id="main">
+
+    <!-- ── Hero：标语 + 活终端 ────────────────────────────── -->
+    <section class="hero" id="top">
+      <div class="hero__inner">
+        <div class="hero__copy">
+          <p class="eyebrow reveal">Node.js 内置 SQLite，无编译，无 postinstall</p>
+          <h1 class="hero__title">
+            <span class="line"><span class="word">零依赖</span></span>
+            <span class="line"><span class="word">类型优先</span></span>
+            <span class="line"><span class="word accent">的 SQLite ORM</span></span>
+          </h1>
+          <p class="hero__lead reveal">Sqlo 是建立在 <code>node:sqlite</code> 之上的薄封装：一个普通对象 schema 推导全部类型，每一条生成的 SQL 都参数绑定，DDL 只通过显式 <code>sync()</code> 与 <code>migrate()</code> 执行。</p>
+          <div class="hero__actions reveal">
+            <a class="btn btn--solid" href="#install">npm install @chaeco/sqlo</a>
+            <a class="btn btn--ghost" href="#demo">看用法 ↓</a>
+          </div>
+        </div>
+
+        <!-- 活终端：Sqlo 查询 → 参数绑定 SQL → 结果 -->
+        <div class="terminal reveal" aria-label="Sqlo 查询演示终端">
+          <div class="terminal__bar">
+            <span class="terminal__dot" aria-hidden="true"></span>
+            <span class="terminal__dot" aria-hidden="true"></span>
+            <span class="terminal__dot" aria-hidden="true"></span>
+            <span class="terminal__title">sqlo — users.ts</span>
+          </div>
+          <div class="terminal__body">
+            <pre class="terminal__code" id="terminalCode"><code></code></pre>
+            <div class="terminal__output" id="terminalOutput">
+              <div class="terminal__row"><span class="tok-comment">-- 生成的 SQL（值一律参数绑定）</span></div>
+              <div class="terminal__row tok-sql" id="termSql"></div>
+              <div class="terminal__row"><span class="tok-comment">-- 绑定参数</span></div>
+              <div class="terminal__row tok-param" id="termParams"></div>
+              <div class="terminal__row"><span class="tok-comment">-- 查询结果</span></div>
+              <div class="terminal__row terminal__result" id="termResult"></div>
+            </div>
+            <div class="terminal__caret" id="terminalCaret" aria-hidden="true">█</div>
+          </div>
+        </div>
+      </div>
+      <div class="hero__scroll-hint" aria-hidden="true">
+        <span>向下滚动</span>
+        <span class="hero__scroll-line"></span>
+      </div>
+    </section>
+
+    <!-- ── 事实带：真实数字 ───────────────────────────────── -->
+    <section class="facts" aria-label="Sqlo 关键事实">
+      <div class="facts__inner">
+        <div class="fact">
+          <span class="fact__value" data-count="0">0</span>
+          <span class="fact__label">第三方原生依赖</span>
+        </div>
+        <div class="fact">
+          <span class="fact__value">1</span>
+          <span class="fact__label">内置模块 node:sqlite</span>
+        </div>
+        <div class="fact">
+          <span class="fact__value fact__value--mono">≥22.5</span>
+          <span class="fact__label">Node 版本要求</span>
+        </div>
+        <div class="fact">
+          <span class="fact__value fact__value--mono">100%</span>
+          <span class="fact__label">查询参数绑定</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 为什么：三个主张 ───────────────────────────────── -->
+    <section class="why section" id="why">
+      <div class="section__head">
+        <p class="eyebrow">为什么是 Sqlo</p>
+        <h2 class="section__title">只做一件事，做得很薄。</h2>
+        <p class="section__sub">不引入 better-sqlite3，不搬运 WASM。用 Node 自带的东西，把类型和安全交给类型系统与参数绑定。</p>
+      </div>
+      <div class="why__grid">
+        <article class="card reveal">
+          <div class="card__icon" aria-hidden="true">→</div>
+          <h3 class="card__title">Schema 即类型</h3>
+          <p class="card__body">一个普通对象定义表结构，<code>RowOf</code> / <code>InsertOf</code> / <code>PatchOf</code> 自动推导实体、插入与更新类型。没有装饰器，没有模型类。</p>
+          <pre class="card__code"><code><span class="tok-comment">// 类型从这里来</span>
+<span class="tok-var">const</span> users = db.define({ name: <span class="tok-str">'users'</span>, columns: { … } });
+<span class="tok-var">const</span> u = users.insert({ … }); <span class="tok-comment">// 完整类型推导</span></code></pre>
+        </article>
+        <article class="card reveal">
+          <div class="card__icon" aria-hidden="true">?</div>
+          <h3 class="card__title">参数绑定是默认</h3>
+          <p class="card__body">生成的每一句 SQL 都用 <code>?</code> 占位符收集参数，值绝不拼接进字符串。注入不是一条可达的路径。</p>
+          <pre class="card__code"><code><span class="tok-comment">// 值 → 绑定参数</span>
+users.query()
+  .where({ age: { gte: <span class="tok-num">18</span> } })
+  .all();
+<span class="tok-comment">// … WHERE "age" >= ?   params: [18]</span></code></pre>
+        </article>
+        <article class="card reveal">
+          <div class="card__icon" aria-hidden="true">!</div>
+          <h3 class="card__title">DDL 显式，迁移诚实</h3>
+          <p class="card__body">表只由 <code>sync()</code> 或 SQL 文件迁移创建，永不自动建表、永不自动 diff。SQLite 的 ALTER 限制被如实对待。</p>
+          <pre class="card__code"><code><span class="tok-var">const</span> applied = db.migrate(
+  loadMigrationsSync(<span class="tok-str">'./migrations'</span>)
+);
+<span class="tok-comment">// SQL 文件 + 版本表，绝不 diff</span></code></pre>
+        </article>
+      </div>
+    </section>
+
+    <!-- ── 用法演示：交互 Tab ─────────────────────────────── -->
+    <section class="demo section" id="demo">
+      <div class="section__head">
+        <p class="eyebrow">用法</p>
+        <h2 class="section__title">从一个对象到一条查询。</h2>
+        <p class="section__sub">三个片段覆盖 Sqlo 的核心工作流——定义、查询、演进。</p>
+      </div>
+
+      <div class="demo__tabs" role="tablist" aria-label="用法示例">
+        <button class="demo__tab is-active" role="tab" aria-selected="true" aria-controls="tab-schema" data-tab="schema">定义</button>
+        <button class="demo__tab" role="tab" aria-selected="false" aria-controls="tab-query" data-tab="query">查询</button>
+        <button class="demo__tab" role="tab" aria-selected="false" aria-controls="tab-evolve" data-tab="evolve">演进</button>
+      </div>
+
+      <div class="demo__panel is-active" id="tab-schema" role="tabpanel" data-panel="schema">
+        <pre class="demo__code"><code><span class="tok-var">import</span> { Sqlo, sql } from <span class="tok-str">'@chaeco/sqlo'</span>;
+
+<span class="tok-var">const</span> db = <span class="tok-var">new</span> Sqlo({ path: <span class="tok-str">':memory:'</span> });
+
+<span class="tok-comment">// 一个普通对象 —— 类型从这里推导</span>
+<span class="tok-var">const</span> users = db.define({
+  name: <span class="tok-str">'users'</span>,
+  columns: {
+    id:    { type: <span class="tok-str">'INTEGER'</span>, primaryKey: <span class="tok-kw">true</span>, autoIncrement: <span class="tok-kw">true</span> },
+    name:  { type: <span class="tok-str">'TEXT'</span>, notNull: <span class="tok-kw">true</span> },
+    email: { type: <span class="tok-str">'TEXT'</span>, notNull: <span class="tok-kw">true</span> },
+    age:   { type: <span class="tok-str">'INTEGER'</span> },
+  },
+  indexes: [{ name: <span class="tok-str">'idx_users_email'</span>, columns: [<span class="tok-str">'email'</span>], unique: <span class="tok-kw">true</span> }],
+});
+
+users.sync(); <span class="tok-comment">// 显式建表 —— 绝不自动</span>
+<span class="tok-var">const</span> alice = users.insert({ name: <span class="tok-str">'alice'</span>, email: <span class="tok-str">'a@x.io'</span>, age: <span class="tok-num">30</span> });
+<span class="tok-comment">// ^? { id: number; name: string; email: string; age: number | null }</span></code></pre>
+      </div>
+
+      <div class="demo__panel" id="tab-query" role="tabpanel" data-panel="query">
+        <pre class="demo__code"><code><span class="tok-var">import</span> { sql } from <span class="tok-str">'@chaeco/sqlo'</span>;
+
+<span class="tok-comment">// 流式构造器 —— 每一条 SQL 都参数绑定</span>
+<span class="tok-var">const</span> adults = users
+  .query()
+  .where({ age: { gte: <span class="tok-num">18</span> } })
+  .orWhere({ name: { like: <span class="tok-str">'admin%'</span> } })
+  .orderBy(<span class="tok-str">'age'</span>, <span class="tok-str">'DESC'</span>)
+  .limit(<span class="tok-num">10</span>)
+  .all();
+
+<span class="tok-comment">// 联表 —— ON 子句是 sql 片段</span>
+<span class="tok-var">const</span> rows = posts
+  .query()
+  .join(<span class="tok-str">'users'</span>, sql<span class="tok-tpl">`users.id = posts.userId`</span>)
+  .select(<span class="tok-str">'posts.title'</span>, <span class="tok-str">'users.name'</span>)
+  .all();
+
+<span class="tok-comment">// 安全组合 —— 值绑定，标识符加引号</span>
+<span class="tok-var">const</span> q = sql<span class="tok-tpl">`SELECT * FROM users WHERE email = ${email}`</span>;
+<span class="tok-comment">// → '… WHERE email = ?'   params: [email]</span></code></pre>
+      </div>
+
+      <div class="demo__panel" id="tab-evolve" role="tabpanel" data-panel="evolve">
+        <pre class="demo__code"><code><span class="tok-var">import</span> { schemaDiff, generateMigrationSql } from <span class="tok-str">'@chaeco/sqlo'</span>;
+
+<span class="tok-comment">// 演进不靠自动 diff —— 而是差异分析 + 你审查后的 SQL 迁移</span>
+<span class="tok-var">const</span> actual   = reflectTableSchema(db, <span class="tok-str">'users'</span>);   <span class="tok-comment">// 数据库里真实的表</span>
+<span class="tok-var">const</span> desired  = { … };                          <span class="tok-comment">// 代码里想要的表</span>
+
+<span class="tok-var">const</span> diff = schemaDiff(actual, desired);
+<span class="tok-comment">// addedColumns → ['email']</span>
+<span class="tok-comment">// statements   → 'ALTER TABLE "users" ADD COLUMN "email" TEXT;'</span>
+
+<span class="tok-comment">// 生成可保存的迁移 SQL 文件</span>
+<span class="tok-var">const</span> sqlFile = generateMigrationSql(actual, desired);
+<span class="tok-comment">// 审查后存入 migrations/003_*.sql，交给 migrate()</span></code></pre>
+      </div>
+    </section>
+
+    <!-- ── 诚实边界 ───────────────────────────────────────── -->
+    <section class="honest section" id="honest">
+      <div class="section__head">
+        <p class="eyebrow">诚实的边界</p>
+        <h2 class="section__title">知道它不做什么，比知道它做什么更重要。</h2>
+      </div>
+      <div class="honest__grid">
+        <div class="honest__item reveal">
+          <h3>同步优先，异步如实</h3>
+          <p>同步 API 是默认且从不隐藏。可选的 <code>AsyncSqlo</code> 用 worker 线程避免事件循环阻塞，但底层 SQLite 仍是同步、单写者——不假装并发。</p>
+        </div>
+        <div class="honest__item reveal">
+          <h3>仅 SQLite</h3>
+          <p>没有跨数据库抽象层，不模拟 SQLite 不具备的能力。换个库就是换一个工具，而不是一层适配器。</p>
+        </div>
+        <div class="honest__item reveal">
+          <h3>显式迁移</h3>
+          <p>SQLite 的 ALTER TABLE 支持有限。Sqlo 用 SQL 文件迁移 + 版本表，从不自动 diff——因为自动 diff 有数据丢失的风险。</p>
+        </div>
+        <div class="honest__item reveal">
+          <h3>最小范围</h3>
+          <p>Schema、模型、查询构造器、类型映射、迁移。没有缓存、没有连接池、没有事件钩子。少即是稳定。</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 安装 / CTA ─────────────────────────────────────── -->
+    <section class="cta section" id="install">
+      <div class="cta__box">
+        <p class="eyebrow">开始使用</p>
+        <h2 class="cta__title">一个内置模块，零安装负担。</h2>
+        <pre class="cta__cmd"><code>$ npm install @chaeco/sqlo</code><span class="cta__cursor" aria-hidden="true"></span></pre>
+        <p class="cta__note">Node.js ≥ 22.5.0 · 无 postinstall · 无编译步骤 · MIT</p>
+        <div class="cta__actions">
+          <a class="btn btn--solid" href="https://github.com/chaeco/sqlo" target="_blank" rel="noopener">GitHub →</a>
+          <a class="btn btn--ghost" href="https://github.com/chaeco/sqlo#readme" target="_blank" rel="noopener">阅读文档</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer__inner">
+      <span class="brand"><span class="brand__mark" aria-hidden="true">&gt;_</span> sqlo</span>
+      <p>零第三方原生依赖 · SQLite-only · 类型优先</p>
+      <p class="footer__meta">MIT License · 基于 Node.js 内置 node:sqlite</p>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

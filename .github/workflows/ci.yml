@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [22, 24] # 22 = 最低要求 (node:sqlite), 24 = 当前 LTS
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+  examples:
+    name: Examples build & run
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install & build root package
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install example dependencies
+        working-directory: examples/basic
+        run: npm ci
+
+      - name: Build example
+        working-directory: examples/basic
+        run: npm run build
+
+      - name: Run example
+        working-directory: examples/basic
+        run: node dist/index.js
+
+  website:
+    name: Website sanity check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: JS syntax check
+        run: node --check website/app.js
+
+      - name: Static files present
+        run: |
+          test -f website/index.html
+          test -f website/style.css
+          test -f website/app.js

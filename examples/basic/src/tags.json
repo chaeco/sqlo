@@ -1,0 +1,11 @@
+{
+  "name": "tags",
+  "columns": {
+    "id":   { "type": "INTEGER", "primaryKey": true, "autoIncrement": true },
+    "label": { "type": "TEXT", "notNull": true, "check": "length(label) > 0" },
+    "color": { "type": "TEXT", "default": "gray" }
+  },
+  "indexes": [
+    { "name": "idx_tags_label", "columns": ["label"], "unique": true }
+  ]
+}

@@ -1,0 +1,53 @@
+{
+  "name": "@chaeco/sqlo",
+  "version": "0.1.0",
+  "description": "Lightweight, SQLite-only ORM built on Node.js built-in node:sqlite. Zero native dependencies.",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "default": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "engines": {
+    "node": ">=22.5.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && node scripts/rewrite-dts.mjs",
+    "test": "npm run build && node --test \"dist/test/**/*.test.js\"",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^5.7.0"
+  },
+  "keywords": [
+    "sqlite",
+    "orm",
+    "node:sqlite",
+    "sql",
+    "database",
+    "typescript",
+    "zero-dependency"
+  ],
+  "license": "MIT",
+  "author": "",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/chaeco/sqlo.git"
+  },
+  "bugs": {
+    "url": "https://github.com/chaeco/sqlo/issues"
+  },
+  "homepage": "https://github.com/chaeco/sqlo#readme"
+}
