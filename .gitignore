@@ -147,9 +147,12 @@ vite.config.ts.timestamp-*
 # dist is intentionally committed so JS projects can consume the package
 # directly from the repo (e.g. `npm install github:chaeco/sqlo`) without a
 # build step. Rebuild + commit on every source change.
-# dist/src is the published artifact; dist/test is only compiled test output.
+# dist/index.js is the published artifact; dist/test is only compiled test output.
 dist/test/
 
 # Test / coverage
 coverage/
 .nyc_output/
+
+# macOS
+.DS_Store

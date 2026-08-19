@@ -18,8 +18,8 @@
 
 import { existsSync, mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { Sqlo, type SqloOptions } from './sqlo.ts';
-import type { MigrationDef } from '../schema/types.ts';
+import { Sqlo, type SqloOptions } from './sqlo';
+import type { MigrationDef } from '../schema/types';
 
 const USER_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 

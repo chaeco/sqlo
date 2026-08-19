@@ -3,8 +3,8 @@
  * Translates a TableDef into CREATE TABLE / CREATE INDEX statements.
  */
 
-import type { ColumnDef, TableDef, SqlFragment } from './types.ts';
-import { isFragment, quoteIdent } from '../query/sql.ts';
+import type { ColumnDef, TableDef, SqlFragment } from './types';
+import { isFragment, quoteIdent } from '../query/sql';
 
 // ---------------------------------------------------------------------------
 // Fragment coercion

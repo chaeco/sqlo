@@ -4,30 +4,30 @@
  * @module sqlo
  */
 
-export { Sqlo } from './core/sqlo.ts';
-export type { SqloOptions, MigrateOptions } from './core/sqlo.ts';
-export { MultiSqlo } from './core/multi-sqlo.ts';
-export type { MultiSqloOptions } from './core/multi-sqlo.ts';
+export { Sqlo } from './core/sqlo';
+export type { SqloOptions, MigrateOptions } from './core/sqlo';
+export { MultiSqlo } from './core/multi-sqlo';
+export type { MultiSqloOptions } from './core/multi-sqlo';
 
-export { isBusyError, isConstraintError, SQLITE } from './core/error.ts';
-export type { SqliteErrorLike } from './core/error.ts';
-export type { LogEntry, LogEvent, LogLevel } from './core/logging.ts';
+export { isBusyError, isConstraintError, SQLITE } from './core/error';
+export type { SqliteErrorLike } from './core/error';
+export type { LogEntry, LogEvent, LogLevel } from './core/logging';
 
-export { Model } from './model/model.ts';
-export { QueryBuilder } from './query/query-builder.ts';
+export { Model } from './model/model';
+export { QueryBuilder } from './query/query-builder';
 
-export { sql, raw, quoteIdent, quoteTable, isFragment, isIdent } from './query/sql.ts';
-export type { SqlFragment, Ident } from './schema/types.ts';
+export { sql, raw, quoteIdent, quoteTable, isFragment, isIdent } from './query/sql';
+export type { SqlFragment, Ident } from './schema/types';
 
-export { tableDDL, columnDDL, indexDDLs } from './schema/ddl.ts';
-export { schemaDiff, generateMigrationSql } from './schema/diff.ts';
-export type { SchemaDiff } from './schema/diff.ts';
-export { reflectTableSchema } from './schema/reflect.ts';
-export { loadTableDefSync } from './schema/json.ts';
+export { tableDDL, columnDDL, indexDDLs } from './schema/ddl';
+export { schemaDiff, generateMigrationSql } from './schema/diff';
+export type { SchemaDiff } from './schema/diff';
+export { reflectTableSchema } from './schema/reflect';
+export { loadTableDefSync } from './schema/json';
 
-export { loadMigrations, loadMigrationsSync } from './migration/migration.ts';
+export { loadMigrations, loadMigrationsSync } from './migration/migration';
 
-export { AsyncSqlo } from './async/async.ts';
+export { AsyncSqlo } from './async/async';
 
 // Type-only exports — re-export so consumers can use type helpers
 export type {
@@ -51,4 +51,4 @@ export type {
 
   MigrationDef,
   MigrationStatus,
-} from './schema/types.ts';
+} from './schema/types';

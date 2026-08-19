@@ -13,7 +13,7 @@
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import type { TableDef } from './types.ts';
+import type { TableDef } from './types';
 
 /**
  * Synchronously load a table definition from a JSON file.

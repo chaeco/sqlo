@@ -2,10 +2,10 @@
  * Model — CRUD operations bound to a table schema.
  */
 
-import type { TableDef, WhereExpr, SqlFragment } from '../schema/types.ts';
-import { quoteIdent } from '../query/sql.ts';
-import { tableDDL, indexDDLs } from '../schema/ddl.ts';
-import { QueryBuilder, type Executor } from '../query/query-builder.ts';
+import type { TableDef, WhereExpr, SqlFragment } from '../schema/types';
+import { quoteIdent } from '../query/sql';
+import { tableDDL, indexDDLs } from '../schema/ddl';
+import { QueryBuilder, type Executor } from '../query/query-builder';
 
 // ---------------------------------------------------------------------------
 // Model

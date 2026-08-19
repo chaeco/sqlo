@@ -9,9 +9,9 @@
  * table-rebuild migration written by hand).
  */
 
-import { quoteIdent } from '../query/sql.ts';
-import { columnDDL, indexDDLs } from './ddl.ts';
-import type { ColumnDef, IndexDef, TableDef, SqlFragment } from './types.ts';
+import { quoteIdent } from '../query/sql';
+import { columnDDL, indexDDLs } from './ddl';
+import type { ColumnDef, IndexDef, TableDef, SqlFragment } from './types';
 
 export interface SchemaDiff {
   /** Column names added in `to` but absent in `from`. */

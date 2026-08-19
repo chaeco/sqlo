@@ -3,8 +3,8 @@
  * Generates SELECT statements with parameter binding.
  */
 
-import type { SqlFragment, WhereExpr, WhereOps, WhereCondition, JoinClause, OrderDir } from '../schema/types.ts';
-import { isFragment, quoteIdent, quoteTable } from './sql.ts';
+import type { SqlFragment, WhereExpr, WhereOps, WhereCondition, JoinClause, OrderDir } from '../schema/types';
+import { isFragment, quoteIdent, quoteTable } from './sql';
 
 // ---------------------------------------------------------------------------
 // Internal query state

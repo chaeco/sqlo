@@ -5,12 +5,12 @@
 import { DatabaseSync, type DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 
 type SQLInputValue = number | bigint | string | Uint8Array | null;
-import type { TableDef, MigrationDef, MigrationStatus, RowOf, InsertOf, PatchOf } from '../schema/types.ts';
-import { Model } from '../model/model.ts';
-import type { Executor } from '../query/query-builder.ts';
-import { quoteIdent } from '../query/sql.ts';
-import { isBusyError } from './error.ts';
-import { shouldLog, type LogEntry, type LogLevel, type LogEvent } from './logging.ts';
+import type { TableDef, MigrationDef, MigrationStatus, RowOf, InsertOf, PatchOf } from '../schema/types';
+import { Model } from '../model/model';
+import type { Executor } from '../query/query-builder';
+import { quoteIdent } from '../query/sql';
+import { isBusyError } from './error';
+import { shouldLog, type LogEntry, type LogLevel, type LogEvent } from './logging';
 
 // ---------------------------------------------------------------------------
 // SqloOptions

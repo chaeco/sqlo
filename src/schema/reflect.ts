@@ -9,9 +9,9 @@
  * indexes are missing and generate a migration.
  */
 
-import { quoteIdent } from '../query/sql.ts';
-import type { Executor } from '../query/query-builder.ts';
-import type { ColumnDef, IndexDef, TableDef } from './types.ts';
+import { quoteIdent } from '../query/sql';
+import type { Executor } from '../query/query-builder';
+import type { ColumnDef, IndexDef, TableDef } from './types';
 
 interface PRAGMA_TableInfo {
   cid: number;

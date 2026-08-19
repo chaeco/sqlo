@@ -1,11 +1,12 @@
+import { workerData, parentPort } from 'node:worker_threads';
+import { DatabaseSync } from 'node:sqlite';
+
 /**
  * Worker bootstrap for the async wrapper.
  *
  * Opens a DatabaseSync connection in the worker thread and processes
  * userland messages (exec, all, get, run, close) one at a time.
  */
-import { parentPort, workerData } from 'node:worker_threads';
-import { DatabaseSync } from 'node:sqlite';
 function send(id, ok, data, error) {
     parentPort.postMessage({ id, ok, data, error });
 }

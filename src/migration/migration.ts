@@ -9,7 +9,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { createRequire } from 'node:module';
-import type { MigrationDef } from '../schema/types.ts';
+import type { MigrationDef } from '../schema/types';
 
 const _require = createRequire(import.meta.url);
 

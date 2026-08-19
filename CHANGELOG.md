@@ -5,6 +5,12 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.3.2] - 2026-08-19
+
+### Changed
+
+- **构建系统 → Rollup** — 源码入口改为单一 ESM bundle（`dist/index.js` + `dist/index.d.ts`），异步 worker 独立产出 `dist/async-worker.js`；测试改用独立 `tsc` 编译到 `dist/test`。源码相对导入不再需要 `.ts` 后缀，`moduleResolution` 为 `bundler`。发布产物从 `dist/src/*` 变为 `dist/index.js`（`exports` 已同步更新）。
+
 ## [0.3.1] - 2026-08-14
 
 ### Fixed

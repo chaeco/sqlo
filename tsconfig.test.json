@@ -1,8 +1,8 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "module": "NodeNext",
-    "moduleResolution": "NodeNext",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
     "lib": ["ES2023"],
     "outDir": "dist",
     "rootDir": ".",
@@ -17,8 +17,10 @@
     "forceConsistentCasingInFileNames": true,
     "isolatedModules": true,
     "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "rewriteRelativeImportExtensions": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"],
+  "include": ["test/**/*.ts", "src/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

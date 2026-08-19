@@ -7,8 +7,8 @@
  * - `quoteIdent(name)` — double-quote and escape a SQL identifier.
  */
 
-import type { SqlFragment, Ident } from '../schema/types.ts';
-import { SQL_FRAGMENT, SQL_IDENT } from '../schema/types.ts';
+import type { SqlFragment, Ident } from '../schema/types';
+import { SQL_FRAGMENT, SQL_IDENT } from '../schema/types';
 
 // ---------------------------------------------------------------------------
 // Helpers
