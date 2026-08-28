@@ -37,6 +37,12 @@ interface ColumnDef<T extends string = SqliteType> {
         onDelete?: RefAction;
         onUpdate?: RefAction;
     };
+    /**
+     * Documentation only — a human-readable column description.
+     * SQLite has no column-comment syntax, so this never appears in DDL,
+     * is ignored by schemaDiff, and cannot be read back via reflectTableSchema.
+     */
+    comment?: string;
 }
 type IndexColumn = string | {
     name: string;
@@ -52,6 +58,8 @@ interface IndexDef {
 interface TableDef<C extends Record<string, ColumnDef<string>> = Record<string, ColumnDef<string>>> {
     name: string;
     columns: C;
+    /** Free-text documentation for the whole table — never part of DDL, diff, or reflection */
+    comment?: string;
     indexes?: readonly IndexDef[];
     /** Table-level CHECK constraints as sql\`...\` fragments or plain SQL expressions (no bound params) */
     checks?: readonly (SqlFragment | string)[];
@@ -909,8 +917,10 @@ declare function generateMigrationSql(from: TableDef, to: TableDef, header?: str
  * (unique / partial), table options (strict / withoutRowId).
  *
  * Not detected (SQLite does not expose them via PRAGMA): column-level
- * CHECK expressions, column references (foreign keys), COLLATE. These are
- * best read from your schema files / migrations instead.
+ * CHECK expressions, column references (foreign keys), COLLATE, and
+ * column comments (`ColumnDef.comment` is documentation-only metadata and
+ * is not stored in the database). These are best read from your schema
+ * files / migrations instead.
  */
 declare function reflectTableSchema(exec: Executor, table: string): TableDef;
 

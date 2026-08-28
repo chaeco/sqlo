@@ -5,6 +5,24 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.4.0] - 2026-08-28
+
+### Added
+
+- **Schema 注释（纯文档元数据）** — `TableDef.comment`（表级）与 `ColumnDef.comment`（列级）接受自由文本注释，只存在于 schema 定义中，适合配置驱动 / 多租户场景的自我文档化与数据字典生成。SQLite 无注释语法，故三个边界明确：不进入 DDL、`schemaDiff()` / `generateMigrationSql()` 忽略（仅改注释不会触发 changedColumns / 表重建）、`reflectTableSchema()` 无法回读；JSON 表定义天然透传。
+
+### Changed
+
+- **`loadTableDefSync()` 加载时即校验 schema** — 校验层 `validateSchema` / `schemaHasReferences` 从 `core/sqlo.ts` 迁移至 `src/schema/validate.ts`，与 `db.define()` 共用同一校验器。JSON 表定义的结构性错误（列缺 `type`、索引指向未知列、重复索引名等）在加载瞬间带文件路径抛出，而非延迟到 `define()`；非标准类型名仍保持 warning 不抛（SQLite 类型亲和语义不变）。
+
+### Fixed
+
+- **根 `tsconfig.json` 孤儿 NodeNext 配置修复** — 根配置曾是无人消费的 `moduleResolution: node16` 配置，IDE 默认加载后对无扩展名相对导入报 TS2835，并级联产生 TS18046「`'x'` is of type `'unknown'`」幽灵错误；现对齐真实构建链（`moduleResolution: bundler` + `allowImportingTsExtensions`），严格选项全部保留。
+
+### Tests
+
+- **206 个单元测试**，新增覆盖：列级 / 表级 comment 不进 DDL、diff 忽略 comment 变更、JSON 透传、Row 类型不含 comment、名为 `comment` 的合法列、JSON 加载即校验与 warning 语义、表级 comment 编译期 string 强制。
+
 ## [0.3.2] - 2026-08-19
 
 ### Changed

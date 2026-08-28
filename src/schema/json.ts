@@ -14,6 +14,7 @@
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import type { TableDef } from './types';
+import { validateSchema } from './validate';
 
 /**
  * Synchronously load a table definition from a JSON file.
@@ -46,5 +47,12 @@ export function loadTableDefSync(jsonPath: string): TableDef {
       `Table definition JSON "${jsonPath}" must contain a single object, got ${Array.isArray(parsed) ? 'an array' : typeof parsed}.`,
     );
   }
-  return parsed as TableDef;
+  const def = parsed as TableDef;
+  const { errors } = validateSchema(def);
+  if (errors.length > 0) {
+    throw new Error(
+      `Invalid table definition "${jsonPath}":\n  ${errors.join('\n  ')}`,
+    );
+  }
+  return def;
 }

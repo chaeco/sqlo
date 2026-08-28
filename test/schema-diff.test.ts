@@ -104,6 +104,42 @@ describe('schemaDiff', () => {
     assert.deepEqual(diff.warnings, []);
   });
 
+  it('ignores column comment changes (documentation-only, no structural impact)', () => {
+    const to: TableDef = {
+      ...from,
+      columns: {
+        ...from.columns,
+        name: { type: 'TEXT', notNull: true, comment: 'display name' },
+        age: { type: 'INTEGER', comment: 'years' },
+      },
+    };
+    const diff = schemaDiff(from, to);
+    assert.deepEqual(diff.addedColumns, []);
+    assert.deepEqual(diff.removedColumns, []);
+    assert.deepEqual(diff.changedColumns, []);
+    assert.deepEqual(diff.statements, []);
+    assert.deepEqual(diff.warnings, []);
+  });
+
+  it('ignores table-level comment changes (documentation-only)', () => {
+    const fromT: TableDef = {
+      name: 't',
+      comment: 'v1',
+      columns: { id: { type: 'INTEGER' } },
+    };
+    const toT: TableDef = {
+      name: 't',
+      comment: 'v2',
+      columns: { id: { type: 'INTEGER' } },
+    };
+    const diff = schemaDiff(fromT, toT);
+    assert.deepEqual(diff.addedColumns, []);
+    assert.deepEqual(diff.removedColumns, []);
+    assert.deepEqual(diff.changedColumns, []);
+    assert.deepEqual(diff.statements, []);
+    assert.deepEqual(diff.warnings, []);
+  });
+
   it('warns when adding a PRIMARY KEY column', () => {
     const to: TableDef = {
       ...from,

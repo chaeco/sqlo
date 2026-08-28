@@ -31,6 +31,11 @@ describe('columnDDL', () => {
     assert.equal(ddl, 'INTEGER REFERENCES "users"("id") ON UPDATE CASCADE');
   });
 
+  it('ignores comment metadata (SQLite has no column-comment syntax)', () => {
+    const ddl = columnDDL({ type: 'TEXT', notNull: true, comment: 'display name' });
+    assert.equal(ddl, 'TEXT NOT NULL');
+  });
+
   it('rejects bound params in column CHECK', () => {
     assert.throws(
       () => columnDDL({ type: 'INTEGER', check: sql`a > ${0}` }),
@@ -109,6 +114,16 @@ describe('tableDDL', () => {
       }),
       /cannot contain bound parameters/,
     );
+  });
+
+  it('ignores table-level comment metadata', () => {
+    const ddl = tableDDL({
+      name: 'users',
+      comment: 'user accounts and profiles',
+      columns: { id: { type: 'INTEGER', primaryKey: true } },
+    });
+    assert.match(ddl, /CREATE TABLE IF NOT EXISTS "users"/);
+    assert.ok(!ddl.includes('user accounts'));
   });
 });
 

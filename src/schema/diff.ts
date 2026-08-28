@@ -40,6 +40,9 @@ export interface SchemaDiff {
 function columnKey(col: ColumnDef<string>): string {
   // Serialize type + constraints so we can detect meaningful changes while
   // ignoring key ordering. Plain-string CHECK/where are compared by text.
+  // `comment` is intentionally excluded: it is documentation-only metadata
+  // with no effect on the database structure, so editing a comment must not
+  // surface as a structural change requiring a table rebuild.
   const chk = col.check;
   const checkText = chk === undefined ? undefined : (typeof chk === 'string' ? chk : chk.text);
   return JSON.stringify({

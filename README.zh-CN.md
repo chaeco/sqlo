@@ -125,7 +125,9 @@ const users = db.define(loadTableDefSync('./schemas/users.json'));
 users.sync();
 ```
 
-加载后的定义与对象字面量走相同的 `db.define()` 校验。注意 JSON 无法表达带绑定
+加载后的定义与对象字面量走相同的 `db.define()` 校验，且 `loadTableDefSync`
+会在**加载时**即完成校验——JSON 里的结构性错误（列缺 `type`、索引指向未知列等）
+会带文件路径立即抛出，而不是延迟到 `define()`。注意 JSON 无法表达带绑定
 参数的片段——CHECK / WHERE 约束在 JSON 里必须是纯 SQL 字符串。
 
 支持的列类型包括 `INTEGER`、`REAL`、`TEXT`、`BLOB`、`NUMERIC`、`BOOLEAN`、
@@ -149,6 +151,24 @@ type User = RowOf<typeof usersSchema>;    // { id: number; name: string; ... }
 type NewUser = InsertOf<typeof usersSchema>;
 type UserPatch = PatchOf<typeof usersSchema>;
 ```
+
+### 注释仅供文档参考
+
+每个表（`comment`）与每一列（`comment: string`）都接受一段自由文本注释，它们只
+存在于你的 schema 定义中：
+
+```ts
+db.define({
+  name: 'users',
+  comment: '用户账号与资料',
+  columns: { score: { type: 'INTEGER', comment: '0–100，每月重置' } },
+});
+```
+
+SQLite 没有注释语法，因此 `comment` 从不进入 DDL，会被 `schemaDiff()` 忽略，无
+法由 `reflectTableSchema()` 回读，并通过 `loadTableDefSync()` 原样往返——加载时
+还会顺带校验整份 schema，JSON 里的结构性错误（列缺 `type`、索引指向未知列等）
+会立即抛出。
 
 ### 外键约束默认开启
 
@@ -655,7 +675,7 @@ pool.closeAll();       // 关闭所有已打开的用户库
 | `schemaDiff(from, to)` | 对比两张表定义，产出语句与警告。 |
 | `generateMigrationSql(from, to)` | 从 diff 生成可审查的迁移 SQL 文本。 |
 | `reflectTableSchema(db, table)` | 从数据库读取表的实际结构。 |
-| `loadTableDefSync(path)` | 从 JSON 文件加载表定义。 |
+| `loadTableDefSync(path)` | 从 JSON 文件加载表定义（加载时即校验）。 |
 | `loadMigrationsSync(dir)` / `loadMigrations(dir)` | 从目录加载 SQL/JS 迁移。 |
 
 ### 类型

@@ -51,8 +51,10 @@ interface PRAGMA_IndexInfo {
  * (unique / partial), table options (strict / withoutRowId).
  *
  * Not detected (SQLite does not expose them via PRAGMA): column-level
- * CHECK expressions, column references (foreign keys), COLLATE. These are
- * best read from your schema files / migrations instead.
+ * CHECK expressions, column references (foreign keys), COLLATE, and
+ * column comments (`ColumnDef.comment` is documentation-only metadata and
+ * is not stored in the database). These are best read from your schema
+ * files / migrations instead.
  */
 export function reflectTableSchema(exec: Executor, table: string): TableDef {
   const result = reflectRaw(exec, table);

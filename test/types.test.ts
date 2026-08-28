@@ -16,6 +16,48 @@ test('ColumnDef rejects misspelled built-in type names at compile time', () => {
   assert.ok('compile-time guards are enforced');
 });
 
+test('comment must be a string at compile time', () => {
+  // @ts-expect-error 'comment' is documentation-only and must be a string
+  const badComment: ColumnDef = { type: 'INTEGER', comment: 123 };
+  void badComment;
+
+  const ok: ColumnDef = { type: 'INTEGER', comment: 'monthly reset' };
+  void ok;
+  assert.ok('comment accepts only strings');
+});
+
+test('comment is documentation-only: never a row column', () => {
+  const db = new Sqlo({ path: ':memory:' });
+  const users = db.define({
+    name: 'users',
+    columns: {
+      id: { type: 'INTEGER', primaryKey: true },
+      name: { type: 'TEXT', comment: 'display name' },
+    },
+  });
+  users.sync();
+  users.insert({ id: 1, name: 'a' });
+  const rows = users.all();
+  assert.equal(rows[0]?.name, 'a');
+  // Row type has no `comment` projection (doc metadata is not a column)
+  // @ts-expect-error 'comment' is documentation-only, not a column
+  rows[0]?.comment;
+  db.close();
+});
+
+test('table-level comment must be a string at compile time', () => {
+  const ok: TableDef = {
+    name: 't',
+    comment: 'accounts',
+    columns: { id: { type: 'INTEGER' } },
+  };
+  void ok;
+  // @ts-expect-error table-level 'comment' is documentation-only and must be a string
+  const bad: TableDef = { name: 't', comment: 123, columns: { id: { type: 'INTEGER' } } };
+  void bad;
+  assert.ok('table-level comment is compile-time string-checked');
+});
+
 test('ColumnDef accepts all five SQLite storage-class types', () => {
   const valid: ColumnDef[] = [
     { type: 'INTEGER' },

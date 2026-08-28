@@ -244,6 +244,20 @@ describe('Model CRUD', () => {
     );
   });
 
+  it('allows a column literally named "comment" (metadata name vs column name)', () => {
+    const t = db.define({
+      name: 'notes',
+      columns: {
+        // A column may share the `comment` metadata field name.
+        comment: { type: 'TEXT', notNull: true, comment: 'a column named comment' },
+      },
+    });
+    t.sync();
+    t.insert({ comment: 'hello' });
+    const rows = t.all();
+    assert.equal(rows[0]?.comment, 'hello');
+  });
+
   it('throws on undefined primary key table findById', () => {
     const tagModel = db.define({
       name: 'tags',

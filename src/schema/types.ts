@@ -58,6 +58,12 @@ export interface ColumnDef<T extends string = SqliteType> {
     onDelete?: RefAction;
     onUpdate?: RefAction;
   };
+  /**
+   * Documentation only — a human-readable column description.
+   * SQLite has no column-comment syntax, so this never appears in DDL,
+   * is ignored by schemaDiff, and cannot be read back via reflectTableSchema.
+   */
+  comment?: string;
 }
 
 export type IndexColumn =
@@ -75,6 +81,8 @@ export interface IndexDef {
 export interface TableDef<C extends Record<string, ColumnDef<string>> = Record<string, ColumnDef<string>>> {
   name: string;
   columns: C;
+  /** Free-text documentation for the whole table — never part of DDL, diff, or reflection */
+  comment?: string;
   indexes?: readonly IndexDef[];
   /** Table-level CHECK constraints as sql\`...\` fragments or plain SQL expressions (no bound params) */
   checks?: readonly (SqlFragment | string)[];

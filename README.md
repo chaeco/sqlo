@@ -131,7 +131,10 @@ users.sync();
 ```
 
 The loaded definition goes through the same `db.define()` validation as
-object literals. Note that a JSON schema cannot express bound-parameter
+object literals — but `loadTableDefSync` validates it **at load time**, so
+structural mistakes in your JSON (a column missing `type`, an index on an
+unknown column, …) throw immediately with the file path instead of surfacing
+later at `define()`. Note that a JSON schema cannot express bound-parameter
 fragments — CHECK / WHERE constraints must be plain SQL strings there.
 
 Supported column types include `INTEGER`, `REAL`, `TEXT`, `BLOB`, `NUMERIC`,
@@ -158,6 +161,26 @@ type User = RowOf<typeof usersSchema>;    // { id: number; name: string; ... }
 type NewUser = InsertOf<typeof usersSchema>;
 type UserPatch = PatchOf<typeof usersSchema>;
 ```
+
+### Comments are documentation-only
+
+Every `TableDef` (a table-level `comment`) and every column (`comment: string`)
+accepts free-text documentation that lives only in your schema definition:
+
+```ts
+db.define({
+  name: 'users',
+  comment: 'user accounts and profiles',
+  columns: { score: { type: 'INTEGER', comment: '0–100, reset monthly' } },
+});
+```
+
+SQLite has no comment syntax, so `comment` never appears in DDL, is ignored by
+`schemaDiff()`, can't be read back by `reflectTableSchema()`, and round-trips
+through `loadTableDefSync()` — which additionally validates the schema at load
+time, so structural mistakes in your JSON (a column missing `type`, an index on
+an unknown column, …) throw immediately instead of surfacing later at
+`define()`.
 
 ### Foreign keys are enforced by default
 
@@ -699,7 +722,7 @@ separators. You can customize the file naming with a `fileName` option.
 | `schemaDiff(from, to)` | Diff two table definitions into statements + warnings. |
 | `generateMigrationSql(from, to)` | Generate a reviewable migration SQL file from a diff. |
 | `reflectTableSchema(db, table)` | Read a table's actual structure from the database. |
-| `loadTableDefSync(path)` | Load a table definition from a JSON file. |
+| `loadTableDefSync(path)` | Load a table definition from a JSON file, validated at load time. |
 | `loadMigrationsSync(dir)` / `loadMigrations(dir)` | Load SQL/JS migrations from a directory. |
 
 ### Types

@@ -26,9 +26,10 @@ describe('loadTableDefSync', () => {
       path,
       JSON.stringify({
         name: 'users',
+        comment: 'user accounts and profiles',
         columns: {
           id: { type: 'INTEGER', primaryKey: true, autoIncrement: true },
-          name: { type: 'TEXT', notNull: true },
+          name: { type: 'TEXT', notNull: true, comment: 'display name' },
           age: { type: 'INTEGER', check: 'age >= 0' },
         },
         indexes: [{ name: 'idx_users_name', columns: ['name'] }],
@@ -38,6 +39,10 @@ describe('loadTableDefSync', () => {
     assert.equal(schema.name, 'users');
     assert.equal(schema.columns.age!.check, 'age >= 0');
     assert.equal(schema.indexes?.[0]?.name, 'idx_users_name');
+    // comment is documentation-only metadata and round-trips through JSON
+    assert.equal(schema.columns.name!.comment, 'display name');
+    // table-level comment round-trips too
+    assert.equal(schema.comment, 'user accounts and profiles');
   });
 
   it('loads a schema usable by db.define()', () => {
@@ -71,6 +76,31 @@ describe('loadTableDefSync', () => {
     const path = join(tmpDir, 'arr.json');
     writeFileSync(path, '[1, 2, 3]');
     assert.throws(() => loadTableDefSync(path), /must contain a single object/);
+  });
+
+  it('throws on an invalid schema at load time, not deferred to define', () => {
+    const path = join(tmpDir, 'no-type.json');
+    writeFileSync(
+      path,
+      JSON.stringify({
+        name: 't',
+        columns: { id: {} }, // missing "type"
+      }),
+    );
+    assert.throws(() => loadTableDefSync(path), /missing a "type"/);
+  });
+
+  it('does not throw on warnings (non-standard type follows SQLite affinity)', () => {
+    const path = join(tmpDir, 'affinity.json');
+    writeFileSync(
+      path,
+      JSON.stringify({
+        name: 't',
+        columns: { note: { type: 'text' } },
+      }),
+    );
+    const schema = loadTableDefSync(path);
+    assert.equal(schema.columns.note!.type, 'text');
   });
 });
 
