@@ -5,6 +5,32 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.5.0] - 2026-09-01
+
+### Added
+
+- **AsyncSqlo 轻量执行器重构：完整 ORM 面镜像为异步类** — 架构从「worker 持有完整 Sqlo 实例、全量转发」改为「大脑在主线程、双手在 worker」：所有类型与查询构建逻辑留在主线程（纯函数、零阻塞），worker 仅作为远端连接执行最终 SQL。新增 `AsyncModel<Row, Insert, Patch>`（由 `AsyncSqlo#define()` 创建，覆盖 insert / insertMany / findById / findOne / findAll / update / delete / deleteAll / count / exists / query）与 `AsyncQueryBuilder<Row>`（流式 SELECT 构造器，链式同步、终结调用一次 RPC，支持 distinct / join 系列 / orWhere / raw / groupBy / orderBy / limit 等）。
+- **异步事务：显式 `tx` 句柄** — `db.transaction(async (tx) => {...})` 回调接收显式句柄：经 `tx.model(...)` 获得绑定到该事务的模型类型安全副本，事务内操作不会被其他工作交错；`db` 绑定的模型会串行排在运行中的事务之后；嵌套事务用 `tx.transaction(async (inner) => {...})`（SAVEPOINT）。`{ retry }` 走真实的异步退避（`setTimeout`），非 busy 错误立即抛出。
+- **异步迁移面** — `db.migrate(migrations, { schema })` 支持与同步侧一致的按迁移独立事务语义。
+- **导出面扩充** — `index.ts` 新增导出 `AsyncModel` / `AsyncQueryBuilder` / `AsyncExecutor` / `AsyncTransaction` 类型。
+
+### Fixed
+
+- **同步事务 busy 退避在打包产物中失效（发布产物级 bug）** — `dist/index.js` 中的退避自旋此前使用空体 `while` 循环实现，rollup tree-shaking 把空体循环当作无副作用语句从 bundle 删除，导致 `retry: N` 在锁释放前瞬间耗尽重试次数而抛 BUSY。现改为 `Atomics.wait` 同步睡眠（有副作用调用，不会被 tree-shake），发布产物退避真实生效——集成测试实测 `retry: 5` 从 1.8ms 变为完整走完 50/100/200/400/800ms 退避后成功。
+
+### Changed
+
+- **AsyncSqlo 全类接口文档同步** — README 英文版与中文版补全新 ORM 面镜像的示例（define / syncAll / CRUD / query 链式 / 显式事务句柄 / migrate）与类表（`AsyncModel`、`AsyncQueryBuilder`）。
+
+### Tests
+
+- **269 个测试**（此前 254）：
+  - **真实场景端到端集成测试**（`test/integration.test.ts`）——博客 CMS 在真实文件库（非 `:memory:`）上的完整生命周期：持久化重开、迁移、CRUD、联表查询、事务回滚、外键级联、MultiSqlo、attach、备份、日志、异步场景与 busy retry。
+  - **AsyncQueryBuilder 缺口补齐**——join / leftJoin / rightJoin / fullJoin / distinct / orWhere / raw 纯同步 toSql 断言。
+  - **事务边界**——insertMany 外层回滚、retry 耗尽后仍抛 busy、非 busy 错误不重试、并发不交错。
+  - **构造选项**——readBigInts 透传 worker、FK 关闭警告 `SQLO_FOREIGN_KEYS_DISABLED`。
+  - **三个低风险缺口**——`Sqlo.prepare()` 直接断言、同步 `Model.update({})` 空 patch 返回 0、`AsyncSqlo.terminate()` 停止 worker。
+
 ## [0.4.0] - 2026-08-28
 
 ### Added

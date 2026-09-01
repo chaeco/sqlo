@@ -57,4 +57,15 @@ describe('AsyncSqlo', () => {
     const rows = await db.all<{ id: number }>('SELECT id FROM t ORDER BY id');
     assert.deepEqual(rows, [{ id: 1 }, { id: 2 }]);
   });
+
+  it('terminate() stops the worker and subsequent operations reject', async () => {
+    const db = new AsyncSqlo(':memory:');
+    await db.exec('CREATE TABLE t (id INTEGER)');
+
+    // terminate is synchronous and returns no value.
+    assert.equal(db.terminate(), undefined);
+
+    // The worker is gone, so the next op can never be answered.
+    await assert.rejects(() => db.exec('SELECT 1'), /Worker exited with code 1/);
+  });
 });

@@ -10,6 +10,12 @@ import { validateSchema, schemaHasReferences } from '../schema/validate';
 import { Model } from '../model/model';
 import type { Executor } from '../query/query-builder';
 import { quoteIdent } from '../query/sql';
+import {
+  ensureMigrationTableSql,
+  getAppliedMigrationsSql,
+  insertMigrationRecordSql,
+  computePending,
+} from '../migration/migration';
 import { isBusyError } from './error';
 import { shouldLog, type LogEntry, type LogLevel, type LogEvent } from './logging';
 
@@ -412,12 +418,11 @@ export class Sqlo implements Executor {
         });
         // Exponential backoff: 50ms, 100ms, 200ms, ...
         const delay = 50 * 2 ** (attempt - 1);
-        const deadline = Date.now() + delay;
-        // Busy-wait via Atomics.wait is not available in the main thread; a
-        // synchronous sleep is the honest way to back off in a sync-first API.
-        while (Date.now() < deadline) {
-          // spin
-        }
+        // Synchronous sleep via Atomics.wait — legal on Node's main thread (only
+        // browsers restrict it to workers). We must not use a bare empty spin
+        // loop here: rollup tree-shakes it out of the bundle as a side-effect-
+        // free statement, which silently removes the backoff from `dist`. 
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
       }
     }
   }
@@ -576,7 +581,7 @@ export class Sqlo implements Executor {
     this.#ensureMigrationTable(schema);
 
     const applied = this.#getAppliedMigrations(schema);
-    const pending = migrations.filter((m) => !applied.has(m.name));
+    const pending = computePending(migrations, applied);
 
     for (const m of pending) {
       // Participate in an outer transaction when present (nested via SAVEPOINT),
@@ -664,28 +669,12 @@ export class Sqlo implements Executor {
     }
   }
 
-  #migrationTableRef(schema: string): string {
-    // 'main' is the default schema — keep the historical bare table name
-    // (`_sqlo_migrations`) so existing databases keep their migration history.
-    // Any other schema is an attached database: quote it explicitly.
-    return schema === 'main'
-      ? '"_sqlo_migrations"'
-      : `${quoteIdent(schema)}."_sqlo_migrations"`;
-  }
-
   #ensureMigrationTable(schema: string): void {
-    this.#db.exec(
-      `CREATE TABLE IF NOT EXISTS ${this.#migrationTableRef(schema)} (
-        "name" TEXT PRIMARY KEY NOT NULL,
-        "applied_at" TEXT NOT NULL
-      )`,
-    );
+    this.#db.exec(ensureMigrationTableSql(schema));
   }
 
   #getAppliedMigrations(schema: string): Map<string, string> {
-    const rows = this.#db.prepare(
-      `SELECT "name", "applied_at" FROM ${this.#migrationTableRef(schema)} ORDER BY "name"`,
-    ).all() as { name: string; applied_at: string }[];
+    const rows = this.#db.prepare(getAppliedMigrationsSql(schema)).all() as { name: string; applied_at: string }[];
     const map = new Map<string, string>();
     for (const row of rows) {
       map.set(row.name, row.applied_at);
@@ -702,9 +691,7 @@ export class Sqlo implements Executor {
       m.up({ exec: (sql: string) => this.#db.exec(sql) });
     }
 
-    this.#db.prepare(
-      `INSERT INTO ${this.#migrationTableRef(schema)} ("name", "applied_at") VALUES (?, ?)`,
-    ).run(m.name, ts);
+    this.#db.prepare(insertMigrationRecordSql(schema)).run(m.name, ts);
   }
 }
 

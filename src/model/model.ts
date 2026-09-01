@@ -8,6 +8,95 @@ import { tableDDL, indexDDLs } from '../schema/ddl';
 import { QueryBuilder, type Executor } from '../query/query-builder';
 
 // ---------------------------------------------------------------------------
+// Pure insert helpers
+//
+// The INSERT pipeline is shared between the synchronous `Model` and the async
+// `AsyncModel`: both validate keys, compile the same SQL, and resolve the row
+// the same way. Keeping these as pure functions (schema + data in, SQL + params
+// out) means there is exactly one place that knows how an insert is built.
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate that every key in `data` is a declared column of the table.
+ * Unknown keys are a programming error — surface them eagerly.
+ */
+export function validateKeys(schema: TableDef, table: string, data: unknown): void {
+  if (typeof data !== 'object' || data === null) return;
+  const colSet = new Set(Object.keys(schema.columns));
+  for (const key of Object.keys(data as Record<string, unknown>)) {
+    if (!colSet.has(key)) {
+      throw new Error(
+        `Unknown column "${key}" on table "${table}". ` +
+        `Valid columns: ${[...colSet].join(', ')}`,
+      );
+    }
+  }
+}
+
+/**
+ * The primary key column names of a schema (in declaration order).
+ */
+export function pkColumns(schema: TableDef): string[] {
+  return Object.entries(schema.columns)
+    .filter(([, col]) => col.primaryKey)
+    .map(([name]) => name);
+}
+
+/**
+ * Compile an INSERT statement for `data`. Returns the SQL, the bound values,
+ * and whether the insert uses `DEFAULT VALUES` (no explicit columns).
+ */
+export function buildInsertSql(
+  _schema: TableDef,
+  table: string,
+  data: unknown,
+): { sql: string; values: unknown[]; isEmpty: boolean } {
+  const cols = Object.keys(data as Record<string, unknown>);
+  if (cols.length === 0) {
+    // INSERT with no columns: use DEFAULT VALUES
+    return { sql: `INSERT INTO ${quoteIdent(table)} DEFAULT VALUES`, values: [], isEmpty: true };
+  }
+  const colIdents = cols.map((c) => quoteIdent(c)).join(', ');
+  const placeholders = cols.map(() => '?').join(', ');
+  const values = Object.values(data as Record<string, unknown>);
+  return {
+    sql: `INSERT INTO ${quoteIdent(table)} (${colIdents}) VALUES (${placeholders})`,
+    values,
+    isEmpty: false,
+  };
+}
+
+/**
+ * Compile the SELECT that resolves a row after insert — by `lastInsertRowid`
+ * on rowid tables, or by its primary-key columns on WITHOUT ROWID tables.
+ */
+export function resolveAfterInsertSql(
+  schema: TableDef,
+  table: string,
+  data: unknown,
+  lastInsertRowid: number | bigint,
+): { sql: string; params: unknown[] } {
+  if (schema.withoutRowId) {
+    const pks = pkColumns(schema);
+    const where: Record<string, unknown> = {};
+    for (const pk of pks) {
+      const v = (data as Record<string, unknown>)[pk];
+      if (v === undefined) {
+        throw new Error(
+          `Cannot resolve row after insert on WITHOUT ROWID table "${table}": ` +
+          `primary key column "${pk}" was not provided in insert data.`,
+        );
+      }
+      where[pk] = v;
+    }
+    const conds = Object.entries(where).map(([k]) => `${quoteIdent(k)} = ?`);
+    return { sql: `SELECT * FROM ${quoteIdent(table)} WHERE ${conds.join(' AND ')}`, params: Object.values(where) };
+  }
+  // Rowid table: use lastInsertRowid (which is also the INTEGER PRIMARY KEY alias)
+  return { sql: `SELECT * FROM ${quoteIdent(table)} WHERE rowid = ?`, params: [lastInsertRowid] };
+}
+
+// ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
 
@@ -52,21 +141,12 @@ export class Model<Row extends Record<string, unknown>, Insert, Patch> {
    * Insert a row and return the full row.
    */
   insert(data: Insert): Row {
-    this.#validateKeys(data);
-    const cols = Object.keys(data as Record<string, unknown>);
-    if (cols.length === 0) {
-      // INSERT with no columns: use DEFAULT VALUES
-      this.#exec.prepare(`INSERT INTO ${quoteIdent(this.table)} DEFAULT VALUES`).run();
-      return this.#resolveAfterInsert(data, this.#lastInsertRowid());
-    }
-    const colIdents = cols.map((c) => quoteIdent(c)).join(', ');
-    const placeholders = cols.map(() => '?').join(', ');
-    const values = Object.values(data as Record<string, unknown>);
-    const stmt = this.#exec.prepare(
-      `INSERT INTO ${quoteIdent(this.table)} (${colIdents}) VALUES (${placeholders})`,
-    );
-    const result = stmt.run(...values);
-    return this.#resolveAfterInsert(data, result.lastInsertRowid);
+    validateKeys(this.#schema, this.table, data);
+    const { sql, values, isEmpty } = buildInsertSql(this.#schema, this.table, data);
+    const result = this.#exec.prepare(sql).run(...values);
+    const rid = isEmpty ? this.#lastInsertRowid() : result.lastInsertRowid;
+    const { sql: selSql, params } = resolveAfterInsertSql(this.#schema, this.table, data, rid);
+    return this.#exec.prepare(selSql).get(...params) as Row;
   }
 
   /**
@@ -127,7 +207,7 @@ export class Model<Row extends Record<string, unknown>, Insert, Patch> {
    * Returns undefined if no rowid-based key column is found — use findOne() instead.
    */
   findById(id: number | bigint | string): Row | undefined {
-    const pkCols = this.#pkColumns();
+    const pkCols = pkColumns(this.#schema);
     if (pkCols.length === 0) {
       throw new Error(
         `Table "${this.table}" has no primary key column defined. Use findOne() instead.`,
@@ -170,7 +250,7 @@ export class Model<Row extends Record<string, unknown>, Insert, Patch> {
    * The `where` argument is required — use `db.exec(...)` or model query builder for bulk updates.
    */
   update(patch: Patch, where: WhereExpr<Partial<Row>> | SqlFragment): number {
-    this.#validateKeys(patch);
+    validateKeys(this.#schema, this.table, patch);
     const patchKeys = Object.keys(patch as Record<string, unknown>);
     if (patchKeys.length === 0) return 0;
 
@@ -256,53 +336,8 @@ export class Model<Row extends Record<string, unknown>, Insert, Patch> {
 
   // ---- Internal ----
 
-  #validateKeys(data: unknown): void {
-    if (typeof data !== 'object' || data === null) return;
-    const colSet = new Set(Object.keys(this.#schema.columns));
-    for (const key of Object.keys(data as Record<string, unknown>)) {
-      if (!colSet.has(key)) {
-        throw new Error(
-          `Unknown column "${key}" on table "${this.table}". ` +
-          `Valid columns: ${[...colSet].join(', ')}`,
-        );
-      }
-    }
-  }
-
   #lastInsertRowid(): number | bigint {
     const row = this.#exec.prepare('SELECT last_insert_rowid() AS "rid"').get() as { rid: number | bigint } | undefined;
     return row?.rid ?? 0;
-  }
-
-  #resolveAfterInsert(data: unknown, lastInsertRowid: number | bigint): Row {
-    const schema = this.#schema;
-    // If WITHOUT ROWID, use primary key columns from input
-    if (schema.withoutRowId) {
-      const pkCols = this.#pkColumns();
-      const where: Record<string, unknown> = {};
-      for (const pk of pkCols) {
-        const v = (data as Record<string, unknown>)[pk];
-        if (v === undefined) {
-          throw new Error(
-            `Cannot resolve row after insert on WITHOUT ROWID table "${this.table}": ` +
-            `primary key column "${pk}" was not provided in insert data.`,
-          );
-        }
-        where[pk] = v;
-      }
-      return this.findOne(where as WhereExpr<Partial<Row>>)!;
-    }
-
-    // Rowid table: use lastInsertRowid (which is also the INTEGER PRIMARY KEY alias)
-    const stmt = this.#exec.prepare(
-      `SELECT * FROM ${quoteIdent(this.table)} WHERE rowid = ?`,
-    );
-    return stmt.get(lastInsertRowid) as Row;
-  }
-
-  #pkColumns(): string[] {
-    return Object.entries(this.#schema.columns)
-      .filter(([, col]) => col.primaryKey)
-      .map(([name]) => name);
   }
 }

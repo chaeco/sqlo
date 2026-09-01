@@ -262,6 +262,32 @@ declare class QueryBuilder<Row extends Record<string, unknown> = Record<string, 
         params: unknown[];
     };
     /**
+     * Compile the `first()` query — a LIMIT 1 copy of the current builder.
+     * Pure: does not mutate the builder and never executes. Shared with the
+     * async `AsyncQueryBuilder`, which reuses the exact same SQL.
+     */
+    buildFirstSql(): {
+        sql: string;
+        params: unknown[];
+    };
+    /**
+     * Compile the `count()` query — COUNT(*) over the current builder.
+     * Pure: never executes. Shared with the async `AsyncQueryBuilder`.
+     */
+    buildCountSql(): {
+        sql: string;
+        params: unknown[];
+    };
+    /**
+     * Compile the `pluck(col)` query — a SELECT of a single column copy of the
+     * current builder. Pure: never executes. Shared with the async
+     * `AsyncQueryBuilder`.
+     */
+    buildPluckSql<C extends keyof Row>(col: C): {
+        sql: string;
+        params: unknown[];
+    };
+    /**
      * Execute and return all matching rows.
      */
     all(): Row[];
@@ -980,6 +1006,236 @@ declare function loadMigrationsSync(dir: string): MigrationDef[];
 declare function loadMigrations(dir: string): Promise<MigrationDef[]>;
 
 /**
+ * Async ORM layer — AsyncModel and AsyncQueryBuilder.
+ *
+ * The "brain on the main thread, hands in the worker" split: the main thread
+ * owns all types and query construction (pure functions, zero blocking); the
+ * worker is a remote connection that only executes final SQL. These classes
+ * mirror the synchronous `Model` and `QueryBuilder` APIs, but every terminal
+ * call is a single RPC to the worker.
+ *
+ * Query construction is deliberately shared with the sync layer:
+ * `AsyncQueryBuilder` wraps a real `QueryBuilder` used purely for SQL
+ * compilation (`toSql`, `buildWhere`, `buildFirstSql`, …), never for
+ * execution; insert/update pipelines reuse the same pure helpers as `Model`.
+ * There is exactly one place that knows how a query is built.
+ */
+
+/**
+ * The async counterpart of the sync `Executor` interface. Implemented by
+ * `AsyncSqlo` / `AsyncTransaction`; consumed by `AsyncModel` /
+ * `AsyncQueryBuilder`. Every method returns a Promise — each call crosses
+ * the worker boundary once.
+ */
+interface AsyncExecutor {
+    all<T extends Record<string, unknown> = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<T[]>;
+    get<T extends Record<string, unknown> = Record<string, unknown>>(sql: string, ...params: unknown[]): Promise<T | undefined>;
+    run(sql: string, ...params: unknown[]): Promise<{
+        changes: number | bigint;
+        lastInsertRowid: number | bigint;
+    }>;
+    exec(sql: string): Promise<void>;
+    /**
+     * Optionally present transaction support. When absent, batch operations
+     * such as `AsyncModel#insertMany` fall back to individual statements.
+     */
+    transaction?<T>(fn: (tx: AsyncTransaction) => Promise<T>, options?: {
+        retry?: number;
+    }): Promise<T>;
+}
+/**
+ * The explicit transaction handle handed to a transaction callback.
+ *
+ * All operations performed through the handle are guaranteed to run inside
+ * the transaction (the handle dispatches directly to the worker — it cannot
+ * be interleaved with other operations). Pass an existing model to
+ * {@link AsyncTransaction#model} to get a copy bound to this transaction:
+ *
+ * ```ts
+ * await db.transaction(async (tx) => {
+ *   const u = tx.model(users); // type-safe copy bound to the transaction
+ *   await u.insert({ name: 'alice' });
+ * });
+ * ```
+ *
+ * Nested transactions are available via `tx.transaction(...)` and use
+ * SAVEPOINT / RELEASE in the worker.
+ */
+interface AsyncTransaction extends AsyncExecutor {
+    /**
+     * Nest another transaction inside this one. Uses SAVEPOINT / RELEASE in the
+     * worker; shares the outer transaction's fate (an inner rollback rolls back
+     * only the inner savepoint, an outer rollback takes the inner with it).
+     */
+    transaction<T>(fn: (tx: AsyncTransaction) => Promise<T>): Promise<T>;
+    /**
+     * Return a copy of `model` bound to this transaction handle. The returned
+     * model has the exact same type; every operation it runs lands inside the
+     * transaction. Use this instead of the `db`-bound model inside a
+     * transaction callback.
+     */
+    model<Row extends Record<string, unknown>, Insert, Patch>(model: AsyncModel<Row, Insert, Patch>): AsyncModel<Row, Insert, Patch>;
+}
+/**
+ * Fluent async SELECT query builder.
+ *
+ * Chain the same methods as the sync `QueryBuilder`; only the terminal calls
+ * (`all`, `first`, `count`, `pluck`) are async — each runs as a single RPC to
+ * the worker. Non-terminal chaining is synchronous and free (SQL stays on the
+ * main thread).
+ */
+declare class AsyncQueryBuilder<Row extends Record<string, unknown> = Record<string, unknown>> {
+    #private;
+    /**
+     * @param exec AsyncExecutor that executes compiled SQL (an AsyncSqlo).
+     * @param table Table name to query (`"table"` or `"schema.table"`).
+     */
+    constructor(exec: AsyncExecutor, table: string);
+    /** Restrict the SELECT to the given columns (quoted as identifiers). */
+    select(...cols: string[]): this;
+    /** Emit `SELECT DISTINCT` to de-duplicate result rows. */
+    distinct(): this;
+    /** INNER JOIN `table` on a `sql\`...\`` ON clause. */
+    join(table: string, on: SqlFragment): this;
+    /** LEFT JOIN `table` on a `sql\`...\`` ON clause. */
+    leftJoin(table: string, on: SqlFragment): this;
+    /** RIGHT JOIN `table` on a `sql\`...\`` ON clause. */
+    rightJoin(table: string, on: SqlFragment): this;
+    /** FULL OUTER JOIN `table` on a `sql\`...\`` ON clause. */
+    fullJoin(table: string, on: SqlFragment): this;
+    /** Add an AND condition — plain-object expression or `sql\`...\`` fragment. */
+    where(cond: WhereExpr<Row> | SqlFragment): this;
+    /** Add an OR condition — same accepted shapes as `where()`. */
+    orWhere(cond: WhereExpr<Row> | SqlFragment): this;
+    /** Append a raw SQL fragment as an AND condition (no param binding). */
+    raw(fragment: SqlFragment | string): this;
+    /** GROUP BY the given columns (quoted as identifiers). */
+    groupBy(...cols: string[]): this;
+    /** HAVING condition on aggregated groups — same shapes as `where()`. */
+    having(cond: WhereExpr<Row> | SqlFragment): this;
+    /** ORDER BY a column (quoted) or a `sql\`...\`` fragment, with direction. */
+    orderBy(col: string | SqlFragment, dir?: OrderDir): this;
+    /** LIMIT the number of returned rows (bound as a parameter). */
+    limit(n: number): this;
+    /** OFFSET the result window (bound as a parameter; usually paired with `limit()`). */
+    offset(n: number): this;
+    /** Build only the WHERE clause (with params) — used for UPDATE/DELETE composition. */
+    buildWhere(): {
+        clause: string;
+        params: unknown[];
+    };
+    /** Return the compiled SQL string and bound parameters. */
+    toSql(): {
+        sql: string;
+        params: unknown[];
+    };
+    /** Compile the `first()` query (LIMIT 1 copy of the builder). Pure. */
+    buildFirstSql(): {
+        sql: string;
+        params: unknown[];
+    };
+    /** Compile the `count()` query (COUNT(*) over the builder). Pure. */
+    buildCountSql(): {
+        sql: string;
+        params: unknown[];
+    };
+    /** Compile the `pluck(col)` query (projection copy of the builder). Pure. */
+    buildPluckSql<C extends keyof Row>(col: C): {
+        sql: string;
+        params: unknown[];
+    };
+    /** Execute and return all matching rows. */
+    all(): Promise<Row[]>;
+    /** Execute and return the first row, or undefined if none. */
+    first(): Promise<Row | undefined>;
+    /** Execute the COUNT query. */
+    count(): Promise<number>;
+    /** Execute and return values of a single column. */
+    pluck<C extends keyof Row>(col: C): Promise<Row[C][]>;
+}
+/**
+ * Async typed CRUD operations bound to a single table schema — the async
+ * mirror of `Model`, created via `AsyncSqlo#define(schema)`.
+ *
+ * Insert/read/update/delete methods are type-driven by the schema's row,
+ * insert, and patch types and share their SQL construction with the sync
+ * layer. Tables are created explicitly with `sync()` — never automatically.
+ * Every method returns a Promise; each call crosses the worker boundary once.
+ */
+declare class AsyncModel<Row extends Record<string, unknown>, Insert, Patch> {
+    #private;
+    readonly table: string;
+    /**
+     * @param exec AsyncExecutor that executes prepared statements (an AsyncSqlo).
+     * @param schema The table definition that drives this model's types.
+     */
+    constructor(exec: AsyncExecutor, schema: TableDef);
+    /**
+     * Create the table (and indexes) if they do not exist.
+     * Must be called explicitly — the ORM will not auto-create tables.
+     */
+    sync(): Promise<void>;
+    /**
+     * Insert a row and return the full row.
+     */
+    insert(data: Insert): Promise<Row>;
+    /**
+     * Insert multiple rows atomically — either all succeed or none are kept.
+     *
+     * Wrapped in a transaction when the executor supports it (AsyncSqlo does).
+     * When called inside an outer `db.transaction(...)`, this nests via
+     * SAVEPOINT and participates in the outer commit/rollback.
+     *
+     * For very large batches, pass `{ chunkSize }` to insert in chunks — each
+     * chunk gets its own transaction (when not already inside an outer
+     * transaction), keeping write-lock hold time and memory bounded. Errors
+     * within a chunk roll back only that chunk; previously committed chunks
+     * stay.
+     */
+    insertMany(rows: Insert[], options?: {
+        chunkSize?: number;
+    }): Promise<Row[]>;
+    /**
+     * Find a row by its primary key (first primaryKey column).
+     * Accepts number / bigint for INTEGER keys and string for TEXT/UUID keys.
+     */
+    findById(id: number | bigint | string): Promise<Row | undefined>;
+    /** Find a single row matching the condition. */
+    findOne(where: WhereExpr<Partial<Row>> | SqlFragment): Promise<Row | undefined>;
+    /** Find all rows matching the optional condition. */
+    findAll(where?: WhereExpr<Partial<Row>> | SqlFragment): Promise<Row[]>;
+    /** Convenience: alias for findAll(). */
+    all(): Promise<Row[]>;
+    /**
+     * Update rows matching the condition. Returns the number of affected rows.
+     * The `where` argument is required.
+     */
+    update(patch: Patch, where: WhereExpr<Partial<Row>> | SqlFragment): Promise<number>;
+    /**
+     * Delete rows matching the condition. Returns the number of deleted rows.
+     * The `where` argument is required.
+     */
+    delete(where: WhereExpr<Partial<Row>> | SqlFragment): Promise<number>;
+    /**
+     * Delete all rows in the table. Returns the number of deleted rows.
+     * Explicit escape hatch — unlike `delete()`, no WHERE is required.
+     */
+    deleteAll(): Promise<number>;
+    /** Count rows matching the optional condition. */
+    count(where?: WhereExpr<Partial<Row>> | SqlFragment): Promise<number>;
+    /** Check if at least one row matches the condition (LIMIT 1 query). */
+    exists(where: WhereExpr<Partial<Row>> | SqlFragment): Promise<boolean>;
+    /** Get a fluent AsyncQueryBuilder for this table. */
+    query(): AsyncQueryBuilder<Row>;
+    /**
+     * Return a copy of this model bound to a different executor (e.g. an
+     * `AsyncTransaction` handle), keeping the exact same type. Use it inside a
+     * transaction callback via `tx.model(...)`.
+     */
+    withExecutor(exec: AsyncExecutor): AsyncModel<Row, Insert, Patch>;
+}
+
+/**
  * Async wrapper for Sqlo.
  *
  * Removes database operations from the main thread by delegating to a
@@ -990,7 +1246,16 @@ declare function loadMigrations(dir: string): Promise<MigrationDef[]>;
  * The underlying SQLite is still synchronous.  Using the async wrapper
  * only avoids event‑loop blocking — it does not make SQLite concurrent.
  * SQLite's single‑writer lock still applies.
+ *
+ * Architecture — "brain on the main thread, hands in the worker":
+ * The main thread owns all types and query construction (pure functions,
+ * zero blocking); the worker is a remote connection that only executes
+ * final SQL. `define` / models / the query builder live on the main thread
+ * and mirror the sync API exactly; every terminal call is a single RPC.
+ * Only execution crosses the worker boundary, so the sync and async layers
+ * share one place that knows how a query is built.
  */
+
 /**
  * Async wrapper around Sqlo that delegates database operations to a worker
  * thread, avoiding event-loop blocking in request-handling contexts.
@@ -999,12 +1264,19 @@ declare function loadMigrations(dir: string): Promise<MigrationDef[]>;
  * single-writer. `AsyncSqlo` only avoids event-loop blocking — it does not
  * make SQLite concurrent, and multi-process writes still surface as lock
  * timeout errors.
+ *
+ * Mirrors the synchronous `Sqlo` API for schema (`define` / `syncAll`),
+ * models (`AsyncModel`), transactions, and migrations. Query construction
+ * stays on the main thread; only execution crosses to the worker.
  */
-declare class AsyncSqlo {
+declare class AsyncSqlo implements AsyncExecutor {
     #private;
     /**
      * @param path Database file path (or `':memory:'`) opened inside the worker.
-     * @param options Options forwarded to the worker's `DatabaseSync` constructor.
+     * @param options Options forwarded to the worker's `DatabaseSync`
+     *   constructor. Foreign-key enforcement defaults to `true` (matching the
+     *   synchronous `Sqlo`), so `define()` can warn when it is disabled while
+     *   the schema declares references.
      */
     constructor(path: string, options?: Record<string, unknown>);
     /**
@@ -1030,7 +1302,84 @@ declare class AsyncSqlo {
         lastInsertRowid: number | bigint;
     }>;
     /**
-     * Close the worker and its database connection.
+     * Define a model for a table — the async mirror of `Sqlo#define`.
+     *
+     * ```ts
+     * const users = await db.define({
+     *   name: 'users',
+     *   columns: {
+     *     id: { type: 'INTEGER', primaryKey: true, autoIncrement: true },
+     *     name: { type: 'TEXT', notNull: true },
+     *   },
+     * });
+     * ```
+     *
+     * Does **not** create the table — call `users.sync()` or `db.syncAll()`.
+     */
+    define<const S extends TableDef>(schema: S): AsyncModel<RowOf<S>, InsertOf<S>, PatchOf<S>>;
+    /**
+     * Create all defined tables and indexes.
+     */
+    syncAll(): Promise<void>;
+    /**
+     * Run a function inside a transaction — the async mirror of
+     * `Sqlo#transaction`. The callback receives an explicit transaction handle
+     * (`tx`); every operation performed through it runs inside the transaction
+     * and cannot be interleaved with other operations.
+     *
+     * ```ts
+     * await db.transaction(async (tx) => {
+     *   const u = tx.model(users); // type-safe copy bound to the transaction
+     *   await u.update({ balance: 0 }, { id });
+     *   await tx.run('UPDATE ledger SET amount = ? WHERE id = ?', 100, 1);
+     * });
+     * ```
+     *
+     * Nested transactions are available on the handle:
+     * `tx.transaction(async (inner) => { ... })` — they use SAVEPOINT / RELEASE
+     * in the worker and share the outer transaction's fate.
+     *
+     * Production concurrency: SQLite is single-writer, so concurrent writers can
+     * hit `SQLITE_BUSY`. Pass `{ retry: n }` to automatically re-run the whole
+     * transaction (from a fresh `BEGIN`) with exponential backoff when the
+     * database is locked. The backoff uses a real `setTimeout` sleep (unlike the
+     * sync API's busy-wait). Other errors propagate immediately. Retries only
+     * apply to top-level transactions — a nested (SAVEPOINT) transaction belongs
+     * to an outer one and is never retried.
+     */
+    transaction<T>(fn: (tx: AsyncTransaction) => Promise<T>, options?: {
+        retry?: number;
+    }): Promise<T>;
+    /**
+     * Run pending migrations — the async mirror of `Sqlo#migrate`. Returns the
+     * list of newly applied migrations.
+     *
+     * Reuses the same pure migration SQL as the sync layer (version table,
+     * applied lookup, pending computation). Each migration runs in its own
+     * transaction through the worker's transaction primitives, so already
+     * applied migrations survive a later failure.
+     *
+     * Pass `{ schema: 'aux' }` to manage the migrations of an attached
+     * database — the version table is created inside that schema.
+     */
+    migrate(migrations: MigrationDef[], options?: MigrateOptions): Promise<MigrationDef[]>;
+    /**
+     * List all migrations with their applied status — the async mirror of
+     * `Sqlo#migrationStatus`. Pass `{ schema }` to inspect an attached
+     * database's migration history.
+     */
+    migrationStatus(migrations: MigrationDef[], options?: MigrateOptions): Promise<MigrationStatus[]>;
+    /**
+     * Create an online backup of the database to another file — the async
+     * mirror of `Sqlo#backup`. Uses SQLite's `VACUUM INTO`, which takes a
+     * consistent snapshot even while the database is in use.
+     *
+     * @param target File path of the backup to create.
+     */
+    backup(target: string): Promise<void>;
+    /**
+     * Close the worker and its database connection. Waits for all queued
+     * operations (including any running transaction) to finish first.
      */
     close(): Promise<void>;
     /**
@@ -1039,5 +1388,5 @@ declare class AsyncSqlo {
     terminate(): void;
 }
 
-export { AsyncSqlo, Model, MultiSqlo, QueryBuilder, SQLITE, Sqlo, columnDDL, generateMigrationSql, indexDDLs, isBusyError, isConstraintError, isFragment, isIdent, loadMigrations, loadMigrationsSync, loadTableDefSync, quoteIdent, quoteTable, raw, reflectTableSchema, schemaDiff, sql, tableDDL };
-export type { ColumnDef, ColumnValue, Ident, IndexDef, InsertOf, LogEntry, LogEvent, LogLevel, MigrateOptions, MigrationDef, MigrationStatus, MultiSqloOptions, OrderDir, PatchOf, RefAction, RowOf, SchemaDiff, SqlFragment, SqlOptions, SqliteErrorLike, SqliteType, SqloOptions, TableDef, TypeToJs, WhereExpr, WhereOps, WhereValue };
+export { AsyncModel, AsyncQueryBuilder, AsyncSqlo, Model, MultiSqlo, QueryBuilder, SQLITE, Sqlo, columnDDL, generateMigrationSql, indexDDLs, isBusyError, isConstraintError, isFragment, isIdent, loadMigrations, loadMigrationsSync, loadTableDefSync, quoteIdent, quoteTable, raw, reflectTableSchema, schemaDiff, sql, tableDDL };
+export type { AsyncExecutor, AsyncTransaction, ColumnDef, ColumnValue, Ident, IndexDef, InsertOf, LogEntry, LogEvent, LogLevel, MigrateOptions, MigrationDef, MigrationStatus, MultiSqloOptions, OrderDir, PatchOf, RefAction, RowOf, SchemaDiff, SqlFragment, SqlOptions, SqliteErrorLike, SqliteType, SqloOptions, TableDef, TypeToJs, WhereExpr, WhereOps, WhereValue };

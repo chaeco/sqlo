@@ -454,7 +454,10 @@ db.migrate([
 
 Sqlo is synchronous by default — that is the honest, simple API. If you need
 to keep the event loop unblocked (e.g. in a web server), the optional
-`AsyncSqlo` wrapper delegates operations to a worker thread:
+`AsyncSqlo` wrapper moves the connection to a worker thread. The design is
+"brain on the main thread, hands in the worker": all types and query
+construction stay on the main thread (pure functions, zero blocking) and only
+the final SQL is shipped to the worker for execution:
 
 ```ts
 import { AsyncSqlo } from '@chaeco/sqlo';
@@ -465,6 +468,55 @@ await db.run('INSERT INTO t (id, name) VALUES (?, ?)', 1, 'alice');
 const rows = await db.all('SELECT * FROM t');
 await db.close();
 ```
+
+The full typed ORM surface is mirrored as async classes — every terminal call
+is a single round-trip to the worker, and fluent query chaining stays
+synchronous and free:
+
+```ts
+const users = db.define({
+  name: 'users',
+  columns: {
+    id: { type: 'INTEGER', primaryKey: true, autoIncrement: true },
+    email: { type: 'TEXT', notNull: true },
+  },
+});
+
+await db.syncAll();                    // explicit DDL, same rule as sync
+
+const row = await users.insert({ email: 'a@example.com' });
+const byId = await users.findById(row.id);
+const adults = await users
+  .query()
+  .where({ age: { gte: 18 } })
+  .orderBy('email')
+  .limit(10)
+  .all();        // chain synchronously, execute once
+
+await users.update({ name: 'bob' }, { id: 1 });
+await users.delete({ id: 1 });
+```
+
+The async transaction/migration surfaces keep the same semantics as the
+synchronous ones, including per-migration transactions and busy retry:
+
+```ts
+await db.transaction(async (tx) => {
+  const u = tx.model(users);   // copy bound to the transaction
+  const p = tx.model(posts);
+  await u.insert({ email: 'c@example.com' });
+  await p.insert({ userId: 1, title: 'Hi' });
+}, { retry: 5 });   // survives transient write contention (true async backoff)
+
+await db.migrate(migrations, { schema: 'main' });
+```
+
+The callback receives an explicit `tx` handle: every operation through it
+runs inside the transaction and cannot be interleaved with other work. Use
+`tx.model(...)` for a type-safe copy of a model bound to the transaction —
+the `db`-bound model is serialized behind the running transaction and would
+dequeue only after it finishes. Nested transactions use
+`tx.transaction(async (inner) => { ... })` (SAVEPOINTs).
 
 > **Honest disclaimer:** SQLite underneath is still synchronous and
 > single-writer. `AsyncSqlo` only avoids event‑loop blocking — it does **not**
@@ -707,7 +759,9 @@ separators. You can customize the file naming with a `fileName` option.
 | `Model<Row, Insert, Patch>` | Typed CRUD bound to one table schema, returned by `db.define()`. |
 | `QueryBuilder<Row>` | Fluent SELECT builder, returned by `model.query()`. |
 | `MultiSqlo` | Per-user database manager for multi-tenant isolation. |
-| `AsyncSqlo` | Optional worker-thread wrapper that avoids event-loop blocking. |
+| `AsyncSqlo` | Optional worker-thread wrapper that avoids event-loop blocking (full ORM surface mirrored as async classes). |
+| `AsyncModel<Row, Insert, Patch>` | Async CRUD mirror of `Model`, created via `AsyncSqlo#define()`. |
+| `AsyncQueryBuilder<Row>` | Fluent async SELECT builder, returned by `AsyncModel#query()` — chaining is sync, terminal calls are one RPC each. |
 
 ### Functions
 
@@ -729,8 +783,7 @@ separators. You can customize the file naming with a `fileName` option.
 
 `SqloOptions`, `MigrateOptions`, `MultiSqloOptions`, `SchemaDiff`, `TableDef`,
 `ColumnDef`, `IndexDef`, `RefAction`, `SqliteType`, `RowOf`, `InsertOf`,
-`PatchOf`, `WhereExpr`, `WhereValue`, `WhereOps`, `OrderDir`, `SqlFragment`,
-`Ident`, `MigrationDef`, `MigrationStatus`, `SqlOptions`.
+`PatchOf`, `WhereExpr`, `WhereValue`, `WhereOps`, `OrderDir`, `SqlFragment`, `Ident`, `MigrationDef`, `MigrationStatus`, `SqlOptions`, `AsyncExecutor`.
 
 ## Design principles
 

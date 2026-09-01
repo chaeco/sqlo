@@ -428,7 +428,9 @@ db.migrate([
 ## 异步封装（可选）
 
 Sqlo 默认是同步的——这是诚实而简单的 API。如果需要在服务器中保持事件循环不被
-阻塞，可选的 `AsyncSqlo` 封装会把操作委托给一个 worker 线程：
+阻塞，可选的 `AsyncSqlo` 封装会把连接移到 worker 线程。设计思路是「大脑在主线
+程、双手在 worker」：所有类型与查询构造都留在主线程（纯函数、零阻塞），只有
+最终的 SQL 被送到 worker 执行：
 
 ```ts
 import { AsyncSqlo } from '@chaeco/sqlo';
@@ -439,6 +441,51 @@ await db.run('INSERT INTO t (id, name) VALUES (?, ?)', 1, 'alice');
 const rows = await db.all('SELECT * FROM t');
 await db.close();
 ```
+
+完整的类型化 ORM 面被镜像为异步类——每个终结调用都是一次到 worker 的往返，
+流式查询链始终保持同步且零阻塞：
+
+```ts
+const users = db.define({
+  name: 'users',
+  columns: {
+    id: { type: 'INTEGER', primaryKey: true, autoIncrement: true },
+    email: { type: 'TEXT', notNull: true },
+  },
+});
+
+await db.syncAll();                    // 显式 DDL，与同步侧同一规则
+
+const row = await users.insert({ email: 'a@example.com' });
+const byId = await users.findById(row.id);
+const adults = await users
+  .query()
+  .where({ age: { gte: 18 } })
+  .orderBy('email')
+  .limit(10)
+  .all();        // 同步链式，一次执行
+
+await users.update({ name: 'bob' }, { id: 1 });
+await users.delete({ id: 1 });
+```
+
+异步事务 / 迁移面与同步侧保持相同语义，包括每个迁移独立事务与 busy 重试：
+
+```ts
+await db.transaction(async (tx) => {
+  const u = tx.model(users);   // 绑定到该事务的模型副本
+  const p = tx.model(posts);
+  await u.insert({ email: 'c@example.com' });
+  await p.insert({ userId: 1, title: 'Hi' });
+}, { retry: 5 });   // 扛得住瞬时写竞争（真正的异步退避）
+
+await db.migrate(migrations, { schema: 'main' });
+```
+
+回调收到显式的 `tx` 句柄：通过它执行的每个操作都在事务内部运行，不会被其他工
+作交错。用 `tx.model(...)` 获取绑定到该事务的模型类型安全副本——绑定在 `db`
+上的模型会被串行排在运行中的事务之后，只有等它结束才会出队。嵌套事务使用
+`tx.transaction(async (inner) => { ... })`（SAVEPOINT）。
 
 > **诚实声明：** 底层 SQLite 仍然是同步且单写者的。`AsyncSqlo` 只是避免事件
 > 循环阻塞——它**不会**让 SQLite 并发，多进程写入仍会表现为锁超时错误。
@@ -660,7 +707,9 @@ pool.closeAll();       // 关闭所有已打开的用户库
 | `Model<Row, Insert, Patch>` | 绑定到单表 schema 的类型化 CRUD，由 `db.define()` 返回。 |
 | `QueryBuilder<Row>` | 流式 SELECT 构造器，由 `model.query()` 返回。 |
 | `MultiSqlo` | 按用户管理独立库实例，实现多租户隔离。 |
-| `AsyncSqlo` | 可选的 worker 线程封装，避免事件循环阻塞。 |
+| `AsyncSqlo` | 可选的 worker 线程封装，避免事件循环阻塞（完整 ORM 面镜像为异步类）。 |
+| `AsyncModel<Row, Insert, Patch>` | `Model` 的异步 CRUD 镜像，由 `AsyncSqlo#define()` 创建。 |
+| `AsyncQueryBuilder<Row>` | 流式异步 SELECT 构造器，由 `AsyncModel#query()` 返回——链式同步，终结调用各一次 RPC。 |
 
 ### 函数
 
@@ -683,7 +732,8 @@ pool.closeAll();       // 关闭所有已打开的用户库
 `SqloOptions`、`MigrateOptions`、`MultiSqloOptions`、`SchemaDiff`、`TableDef`、
 `ColumnDef`、`IndexDef`、`RefAction`、`SqliteType`、`RowOf`、`InsertOf`、
 `PatchOf`、`WhereExpr`、`WhereValue`、`WhereOps`、`OrderDir`、`SqlFragment`、
-`Ident`、`MigrationDef`、`MigrationStatus`、`SqlOptions`。
+`Ident`、`MigrationDef`、`MigrationStatus`、`SqlOptions`、`AsyncExecutor`、
+`AsyncTransaction`。
 
 ## 设计原则
 

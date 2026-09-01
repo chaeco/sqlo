@@ -164,6 +164,14 @@ describe('Model CRUD', () => {
     assert.throws(() => users.update({ age: 11 }, {}), /requires a WHERE/i);
   });
 
+  it('update with an empty patch returns 0 without touching rows', () => {
+    const row = users.insert({ name: 'a', email: 'a@x.io', age: 10 });
+    const n = users.update({} as never, { id: row.id });
+    assert.equal(n, 0);
+    const unchanged = users.findById(row.id)!;
+    assert.equal(unchanged.age, 10);
+  });
+
   it('delete removes matching rows', () => {
     const row = users.insert({ name: 'a', email: 'a@x.io' });
     assert.equal(users.delete({ id: row.id }), 1);

@@ -28,6 +28,8 @@ export { loadTableDefSync } from './schema/json';
 export { loadMigrations, loadMigrationsSync } from './migration/migration';
 
 export { AsyncSqlo } from './async/async';
+export { AsyncModel, AsyncQueryBuilder } from './async/async-model';
+export type { AsyncExecutor, AsyncTransaction } from './async/async-model';
 
 // Type-only exports — re-export so consumers can use type helpers
 export type {

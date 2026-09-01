@@ -1,7 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
-import { mkdirSync, existsSync, readFileSync, readdirSync } from 'node:fs';
-import { resolve, join, dirname } from 'node:path';
+import { readdirSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
+import { resolve, join, dirname } from 'node:path';
 import { createRequire } from 'node:module';
 import { Worker } from 'node:worker_threads';
 import { fileURLToPath } from 'node:url';
@@ -607,6 +607,44 @@ class QueryBuilder {
         }
         return { sql: parts.join(' '), params };
     }
+    // ---- Build helpers (terminal SQL, not executed) ----
+    /**
+     * Compile the `first()` query — a LIMIT 1 copy of the current builder.
+     * Pure: does not mutate the builder and never executes. Shared with the
+     * async `AsyncQueryBuilder`, which reuses the exact same SQL.
+     */
+    buildFirstSql() {
+        return this.#clone().limit(1).toSql();
+    }
+    /**
+     * Compile the `count()` query — COUNT(*) over the current builder.
+     * Pure: never executes. Shared with the async `AsyncQueryBuilder`.
+     */
+    buildCountSql() {
+        const params = [];
+        let countSql;
+        if (this.#s.groupBys.length > 0 || this.#s.joins.length > 0) {
+            // Wrap in subquery to handle GROUP BY / JOIN row multiplication
+            const inner = this.toSql();
+            countSql = `SELECT COUNT(*) AS "c" FROM (${inner.sql})`;
+            params.push(...inner.params);
+        }
+        else {
+            countSql = `SELECT COUNT(*) AS "c" FROM ${quoteTable(this.#s.table)}`;
+            const whereClause = this.#buildWhereClauses(this.#s.whereGroups, params);
+            if (whereClause)
+                countSql += ` ${whereClause}`;
+        }
+        return { sql: countSql, params };
+    }
+    /**
+     * Compile the `pluck(col)` query — a SELECT of a single column copy of the
+     * current builder. Pure: never executes. Shared with the async
+     * `AsyncQueryBuilder`.
+     */
+    buildPluckSql(col) {
+        return this.#clone().select(col).toSql();
+    }
     // ---- Execute ----
     /**
      * Execute and return all matching rows.
@@ -622,29 +660,16 @@ class QueryBuilder {
      * copy, so the builder stays reusable afterwards.
      */
     first() {
-        const q = this.#clone().limit(1).toSql();
-        const stmt = this.#exec.prepare(q.sql);
-        return stmt.get(...q.params);
+        const { sql, params } = this.buildFirstSql();
+        const stmt = this.#exec.prepare(sql);
+        return stmt.get(...params);
     }
     /**
      * Execute COUNT query.
      */
     count() {
-        const params = [];
-        let countSql;
-        if (this.#s.groupBys.length > 0 || this.#s.joins.length > 0) {
-            // Wrap in subquery to handle GROUP BY / JOIN row multiplication
-            const inner = this.toSql();
-            countSql = `SELECT COUNT(*) AS "c" FROM (${inner.sql})`;
-            params.push(...inner.params);
-        }
-        else {
-            countSql = `SELECT COUNT(*) AS "c" FROM ${quoteTable(this.#s.table)}`;
-            const whereClause = this.#buildWhereClauses(this.#s.whereGroups, params);
-            if (whereClause)
-                countSql += ` ${whereClause}`;
-        }
-        const stmt = this.#exec.prepare(countSql);
+        const { sql, params } = this.buildCountSql();
+        const stmt = this.#exec.prepare(sql);
         const row = stmt.get(...params);
         return row?.c ?? 0;
     }
@@ -653,7 +678,7 @@ class QueryBuilder {
      * Does not mutate the builder — projection is applied on a copy.
      */
     pluck(col) {
-        const { sql, params } = this.#clone().select(col).toSql();
+        const { sql, params } = this.buildPluckSql(col);
         const stmt = this.#exec.prepare(sql);
         const rows = stmt.all(...params);
         return rows.map((r) => r[col]);
@@ -828,6 +853,78 @@ function extractValues(arr) {
  * Model — CRUD operations bound to a table schema.
  */
 // ---------------------------------------------------------------------------
+// Pure insert helpers
+//
+// The INSERT pipeline is shared between the synchronous `Model` and the async
+// `AsyncModel`: both validate keys, compile the same SQL, and resolve the row
+// the same way. Keeping these as pure functions (schema + data in, SQL + params
+// out) means there is exactly one place that knows how an insert is built.
+// ---------------------------------------------------------------------------
+/**
+ * Validate that every key in `data` is a declared column of the table.
+ * Unknown keys are a programming error — surface them eagerly.
+ */
+function validateKeys(schema, table, data) {
+    if (typeof data !== 'object' || data === null)
+        return;
+    const colSet = new Set(Object.keys(schema.columns));
+    for (const key of Object.keys(data)) {
+        if (!colSet.has(key)) {
+            throw new Error(`Unknown column "${key}" on table "${table}". ` +
+                `Valid columns: ${[...colSet].join(', ')}`);
+        }
+    }
+}
+/**
+ * The primary key column names of a schema (in declaration order).
+ */
+function pkColumns(schema) {
+    return Object.entries(schema.columns)
+        .filter(([, col]) => col.primaryKey)
+        .map(([name]) => name);
+}
+/**
+ * Compile an INSERT statement for `data`. Returns the SQL, the bound values,
+ * and whether the insert uses `DEFAULT VALUES` (no explicit columns).
+ */
+function buildInsertSql(_schema, table, data) {
+    const cols = Object.keys(data);
+    if (cols.length === 0) {
+        // INSERT with no columns: use DEFAULT VALUES
+        return { sql: `INSERT INTO ${quoteIdent(table)} DEFAULT VALUES`, values: [], isEmpty: true };
+    }
+    const colIdents = cols.map((c) => quoteIdent(c)).join(', ');
+    const placeholders = cols.map(() => '?').join(', ');
+    const values = Object.values(data);
+    return {
+        sql: `INSERT INTO ${quoteIdent(table)} (${colIdents}) VALUES (${placeholders})`,
+        values,
+        isEmpty: false,
+    };
+}
+/**
+ * Compile the SELECT that resolves a row after insert — by `lastInsertRowid`
+ * on rowid tables, or by its primary-key columns on WITHOUT ROWID tables.
+ */
+function resolveAfterInsertSql(schema, table, data, lastInsertRowid) {
+    if (schema.withoutRowId) {
+        const pks = pkColumns(schema);
+        const where = {};
+        for (const pk of pks) {
+            const v = data[pk];
+            if (v === undefined) {
+                throw new Error(`Cannot resolve row after insert on WITHOUT ROWID table "${table}": ` +
+                    `primary key column "${pk}" was not provided in insert data.`);
+            }
+            where[pk] = v;
+        }
+        const conds = Object.entries(where).map(([k]) => `${quoteIdent(k)} = ?`);
+        return { sql: `SELECT * FROM ${quoteIdent(table)} WHERE ${conds.join(' AND ')}`, params: Object.values(where) };
+    }
+    // Rowid table: use lastInsertRowid (which is also the INTEGER PRIMARY KEY alias)
+    return { sql: `SELECT * FROM ${quoteIdent(table)} WHERE rowid = ?`, params: [lastInsertRowid] };
+}
+// ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
 /**
@@ -866,19 +963,12 @@ class Model {
      * Insert a row and return the full row.
      */
     insert(data) {
-        this.#validateKeys(data);
-        const cols = Object.keys(data);
-        if (cols.length === 0) {
-            // INSERT with no columns: use DEFAULT VALUES
-            this.#exec.prepare(`INSERT INTO ${quoteIdent(this.table)} DEFAULT VALUES`).run();
-            return this.#resolveAfterInsert(data, this.#lastInsertRowid());
-        }
-        const colIdents = cols.map((c) => quoteIdent(c)).join(', ');
-        const placeholders = cols.map(() => '?').join(', ');
-        const values = Object.values(data);
-        const stmt = this.#exec.prepare(`INSERT INTO ${quoteIdent(this.table)} (${colIdents}) VALUES (${placeholders})`);
-        const result = stmt.run(...values);
-        return this.#resolveAfterInsert(data, result.lastInsertRowid);
+        validateKeys(this.#schema, this.table, data);
+        const { sql, values, isEmpty } = buildInsertSql(this.#schema, this.table, data);
+        const result = this.#exec.prepare(sql).run(...values);
+        const rid = isEmpty ? this.#lastInsertRowid() : result.lastInsertRowid;
+        const { sql: selSql, params } = resolveAfterInsertSql(this.#schema, this.table, data, rid);
+        return this.#exec.prepare(selSql).get(...params);
     }
     /**
      * Insert multiple rows atomically — either all succeed or none are kept.
@@ -934,7 +1024,7 @@ class Model {
      * Returns undefined if no rowid-based key column is found — use findOne() instead.
      */
     findById(id) {
-        const pkCols = this.#pkColumns();
+        const pkCols = pkColumns(this.#schema);
         if (pkCols.length === 0) {
             throw new Error(`Table "${this.table}" has no primary key column defined. Use findOne() instead.`);
         }
@@ -971,7 +1061,7 @@ class Model {
      * The `where` argument is required — use `db.exec(...)` or model query builder for bulk updates.
      */
     update(patch, where) {
-        this.#validateKeys(patch);
+        validateKeys(this.#schema, this.table, patch);
         const patchKeys = Object.keys(patch);
         if (patchKeys.length === 0)
             return 0;
@@ -1041,46 +1131,140 @@ class Model {
         return new QueryBuilder(this.#exec, this.table);
     }
     // ---- Internal ----
-    #validateKeys(data) {
-        if (typeof data !== 'object' || data === null)
-            return;
-        const colSet = new Set(Object.keys(this.#schema.columns));
-        for (const key of Object.keys(data)) {
-            if (!colSet.has(key)) {
-                throw new Error(`Unknown column "${key}" on table "${this.table}". ` +
-                    `Valid columns: ${[...colSet].join(', ')}`);
-            }
-        }
-    }
     #lastInsertRowid() {
         const row = this.#exec.prepare('SELECT last_insert_rowid() AS "rid"').get();
         return row?.rid ?? 0;
     }
-    #resolveAfterInsert(data, lastInsertRowid) {
-        const schema = this.#schema;
-        // If WITHOUT ROWID, use primary key columns from input
-        if (schema.withoutRowId) {
-            const pkCols = this.#pkColumns();
-            const where = {};
-            for (const pk of pkCols) {
-                const v = data[pk];
-                if (v === undefined) {
-                    throw new Error(`Cannot resolve row after insert on WITHOUT ROWID table "${this.table}": ` +
-                        `primary key column "${pk}" was not provided in insert data.`);
-                }
-                where[pk] = v;
-            }
-            return this.findOne(where);
+}
+
+/**
+ * Migration utilities — file loader and runner helpers.
+ *
+ * Core migration logic lives in `Sqlo.migrate()` and `Sqlo.migrationStatus()`.
+ * This module provides the file‑based loader.
+ */
+const _require = createRequire(import.meta.url);
+// ---------------------------------------------------------------------------
+// Migration primitives (pure)
+//
+// The version-table schema and pending computation are shared between the
+// synchronous `Sqlo.migrate()` / `Sqlo.migrationStatus()` and the async
+// `AsyncSqlo` wrapper, which reuses the exact same SQL. Only the transaction
+// wrapping differs: sync Sqlo uses its SAVEPOINT machinery directly, while
+// AsyncSqlo delegates to worker txBegin/txCommit/txRollback primitives.
+// ---------------------------------------------------------------------------
+/**
+ * The version table reference for a schema. `'main'` keeps the historical
+ * bare name (`_sqlo_migrations`) so existing databases keep their migration
+ * history; any other schema is an attached database and is quoted explicitly.
+ */
+function migrationTableRef(schema) {
+    return schema === 'main'
+        ? '"_sqlo_migrations"'
+        : `${quoteIdent(schema)}."_sqlo_migrations"`;
+}
+/**
+ * CREATE TABLE IF NOT EXISTS for the version table in the given schema.
+ */
+function ensureMigrationTableSql(schema) {
+    return `CREATE TABLE IF NOT EXISTS ${migrationTableRef(schema)} (
+    "name" TEXT PRIMARY KEY NOT NULL,
+    "applied_at" TEXT NOT NULL
+  )`;
+}
+/**
+ * SELECT listing applied migration names and timestamps, ordered by name.
+ */
+function getAppliedMigrationsSql(schema) {
+    return `SELECT "name", "applied_at" FROM ${migrationTableRef(schema)} ORDER BY "name"`;
+}
+/**
+ * INSERT recording an applied migration.
+ */
+function insertMigrationRecordSql(schema) {
+    return `INSERT INTO ${migrationTableRef(schema)} ("name", "applied_at") VALUES (?, ?)`;
+}
+/**
+ * The subset of `migrations` not yet present in `applied`, preserving order.
+ */
+function computePending(migrations, applied) {
+    return migrations.filter((m) => !applied.has(m.name));
+}
+/**
+ * Synchronously load migrations from a directory.
+ *
+ * - `.sql` files: treated as up‑only migrations (the entire file content is the SQL).
+ * - `.mjs` / `.js` / `.cjs` files: must default‑export a `MigrationDef` or an array of `MigrationDef`.
+ *
+ * Files are sorted alphabetically by name.
+ */
+function loadMigrationsSync(dir) {
+    const absDir = resolve(dir);
+    const entries = readdirSync(absDir, { withFileTypes: true })
+        .filter((e) => e.isFile())
+        .map((e) => e.name)
+        .sort();
+    const migrations = [];
+    for (const entry of entries) {
+        const ext = entry.split('.').pop()?.toLowerCase();
+        const name = entry.replace(/\.\w+$/, '');
+        const fullPath = resolve(absDir, entry);
+        if (ext === 'sql') {
+            const sql = readFileSync(fullPath, 'utf-8');
+            migrations.push({ name, up: sql });
         }
-        // Rowid table: use lastInsertRowid (which is also the INTEGER PRIMARY KEY alias)
-        const stmt = this.#exec.prepare(`SELECT * FROM ${quoteIdent(this.table)} WHERE rowid = ?`);
-        return stmt.get(lastInsertRowid);
+        else if (ext === 'js' || ext === 'cjs' || ext === 'mjs') {
+            if (ext === 'mjs') {
+                throw new Error(`Cannot load .mjs migration synchronously: "${entry}". ` +
+                    'Use loadMigrations() (async) instead.');
+            }
+            const mod = _require(fullPath);
+            const result = mod.default ?? mod;
+            if (Array.isArray(result)) {
+                migrations.push(...result);
+            }
+            else {
+                migrations.push(result);
+            }
+        }
     }
-    #pkColumns() {
-        return Object.entries(this.#schema.columns)
-            .filter(([, col]) => col.primaryKey)
-            .map(([name]) => name);
+    return migrations;
+}
+/**
+ * Asynchronously load migrations from a directory using `import()`.
+ *
+ * Handles `.sql`, `.mjs`, `.js`, and `.cjs` files.
+ */
+async function loadMigrations(dir) {
+    const absDir = resolve(dir);
+    const entries = (await readdir(absDir, { withFileTypes: true }))
+        .filter((e) => e.isFile())
+        .map((e) => e.name)
+        .sort();
+    const migrations = [];
+    for (const entry of entries) {
+        const ext = entry.split('.').pop()?.toLowerCase();
+        const name = entry.replace(/\.\w+$/, '');
+        const fullPath = resolve(absDir, entry);
+        if (ext === 'sql') {
+            const sql = await readFile(fullPath, 'utf-8');
+            migrations.push({ name, up: sql });
+        }
+        else if (ext === 'js' || ext === 'mjs' || ext === 'cjs') {
+            const absUrl = ext === 'cjs'
+                ? fullPath
+                : `file://${fullPath}`;
+            const mod = await import(absUrl);
+            const result = mod.default ?? mod;
+            if (Array.isArray(result)) {
+                migrations.push(...result);
+            }
+            else {
+                migrations.push(result);
+            }
+        }
     }
+    return migrations;
 }
 
 // ---------------------------------------------------------------------------
@@ -1470,6 +1654,13 @@ class Sqlo {
                     detail: `backoff delay computed for attempt ${attempt}`,
                     level: 'warn',
                 });
+                // Exponential backoff: 50ms, 100ms, 200ms, ...
+                const delay = 50 * 2 ** (attempt - 1);
+                // Synchronous sleep via Atomics.wait — legal on Node's main thread (only
+                // browsers restrict it to workers). We must not use a bare empty spin
+                // loop here: rollup tree-shakes it out of the bundle as a side-effect-
+                // free statement, which silently removes the backoff from `dist`. 
+                Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
             }
         }
     }
@@ -1612,7 +1803,7 @@ class Sqlo {
         const schema = options?.schema ?? 'main';
         this.#ensureMigrationTable(schema);
         const applied = this.#getAppliedMigrations(schema);
-        const pending = migrations.filter((m) => !applied.has(m.name));
+        const pending = computePending(migrations, applied);
         for (const m of pending) {
             // Participate in an outer transaction when present (nested via SAVEPOINT),
             // otherwise open a dedicated transaction per migration so that already
@@ -1692,22 +1883,11 @@ class Sqlo {
             throw new Error('Database connection is not open.');
         }
     }
-    #migrationTableRef(schema) {
-        // 'main' is the default schema — keep the historical bare table name
-        // (`_sqlo_migrations`) so existing databases keep their migration history.
-        // Any other schema is an attached database: quote it explicitly.
-        return schema === 'main'
-            ? '"_sqlo_migrations"'
-            : `${quoteIdent(schema)}."_sqlo_migrations"`;
-    }
     #ensureMigrationTable(schema) {
-        this.#db.exec(`CREATE TABLE IF NOT EXISTS ${this.#migrationTableRef(schema)} (
-        "name" TEXT PRIMARY KEY NOT NULL,
-        "applied_at" TEXT NOT NULL
-      )`);
+        this.#db.exec(ensureMigrationTableSql(schema));
     }
     #getAppliedMigrations(schema) {
-        const rows = this.#db.prepare(`SELECT "name", "applied_at" FROM ${this.#migrationTableRef(schema)} ORDER BY "name"`).all();
+        const rows = this.#db.prepare(getAppliedMigrationsSql(schema)).all();
         const map = new Map();
         for (const row of rows) {
             map.set(row.name, row.applied_at);
@@ -1722,7 +1902,7 @@ class Sqlo {
         else {
             m.up({ exec: (sql) => this.#db.exec(sql) });
         }
-        this.#db.prepare(`INSERT INTO ${this.#migrationTableRef(schema)} ("name", "applied_at") VALUES (?, ?)`).run(m.name, ts);
+        this.#db.prepare(insertMigrationRecordSql(schema)).run(m.name, ts);
     }
 }
 // ---------------------------------------------------------------------------
@@ -2213,87 +2393,375 @@ function loadTableDefSync(jsonPath) {
 }
 
 /**
- * Migration utilities — file loader and runner helpers.
+ * Async ORM layer — AsyncModel and AsyncQueryBuilder.
  *
- * Core migration logic lives in `Sqlo.migrate()` and `Sqlo.migrationStatus()`.
- * This module provides the file‑based loader.
+ * The "brain on the main thread, hands in the worker" split: the main thread
+ * owns all types and query construction (pure functions, zero blocking); the
+ * worker is a remote connection that only executes final SQL. These classes
+ * mirror the synchronous `Model` and `QueryBuilder` APIs, but every terminal
+ * call is a single RPC to the worker.
+ *
+ * Query construction is deliberately shared with the sync layer:
+ * `AsyncQueryBuilder` wraps a real `QueryBuilder` used purely for SQL
+ * compilation (`toSql`, `buildWhere`, `buildFirstSql`, …), never for
+ * execution; insert/update pipelines reuse the same pure helpers as `Model`.
+ * There is exactly one place that knows how a query is built.
  */
-const _require = createRequire(import.meta.url);
+// ---------------------------------------------------------------------------
+// AsyncQueryBuilder
+// ---------------------------------------------------------------------------
 /**
- * Synchronously load migrations from a directory.
- *
- * - `.sql` files: treated as up‑only migrations (the entire file content is the SQL).
- * - `.mjs` / `.js` / `.cjs` files: must default‑export a `MigrationDef` or an array of `MigrationDef`.
- *
- * Files are sorted alphabetically by name.
+ * An executor that is never used for actual execution. AsyncQueryBuilder only
+ * compiles SQL through the wrapped QueryBuilder; final execution always goes
+ * through `#exec` (a single RPC). Defensive: if a non-terminal wrapper ever
+ * leaked into a sync terminal method, this throws loudly instead of silently
+ * running on the main thread.
  */
-function loadMigrationsSync(dir) {
-    const absDir = resolve(dir);
-    const entries = readdirSync(absDir, { withFileTypes: true })
-        .filter((e) => e.isFile())
-        .map((e) => e.name)
-        .sort();
-    const migrations = [];
-    for (const entry of entries) {
-        const ext = entry.split('.').pop()?.toLowerCase();
-        const name = entry.replace(/\.\w+$/, '');
-        const fullPath = resolve(absDir, entry);
-        if (ext === 'sql') {
-            const sql = readFileSync(fullPath, 'utf-8');
-            migrations.push({ name, up: sql });
-        }
-        else if (ext === 'js' || ext === 'cjs' || ext === 'mjs') {
-            if (ext === 'mjs') {
-                throw new Error(`Cannot load .mjs migration synchronously: "${entry}". ` +
-                    'Use loadMigrations() (async) instead.');
-            }
-            const mod = _require(fullPath);
-            const result = mod.default ?? mod;
-            if (Array.isArray(result)) {
-                migrations.push(...result);
-            }
-            else {
-                migrations.push(result);
-            }
-        }
+const UNREACHABLE_EXECUTOR = {
+    prepare() {
+        throw new Error('AsyncQueryBuilder compiles SQL on the main thread but never executes ' +
+            'synchronously — use the async terminal methods (all/first/count/pluck).');
+    },
+};
+/**
+ * Fluent async SELECT query builder.
+ *
+ * Chain the same methods as the sync `QueryBuilder`; only the terminal calls
+ * (`all`, `first`, `count`, `pluck`) are async — each runs as a single RPC to
+ * the worker. Non-terminal chaining is synchronous and free (SQL stays on the
+ * main thread).
+ */
+class AsyncQueryBuilder {
+    #qb;
+    #exec;
+    /**
+     * @param exec AsyncExecutor that executes compiled SQL (an AsyncSqlo).
+     * @param table Table name to query (`"table"` or `"schema.table"`).
+     */
+    constructor(exec, table) {
+        this.#exec = exec;
+        this.#qb = new QueryBuilder(UNREACHABLE_EXECUTOR, table);
     }
-    return migrations;
+    // ---- SELECT ----
+    /** Restrict the SELECT to the given columns (quoted as identifiers). */
+    select(...cols) {
+        this.#qb.select(...cols);
+        return this;
+    }
+    /** Emit `SELECT DISTINCT` to de-duplicate result rows. */
+    distinct() {
+        this.#qb.distinct();
+        return this;
+    }
+    // ---- JOIN ----
+    /** INNER JOIN `table` on a `sql\`...\`` ON clause. */
+    join(table, on) {
+        this.#qb.join(table, on);
+        return this;
+    }
+    /** LEFT JOIN `table` on a `sql\`...\`` ON clause. */
+    leftJoin(table, on) {
+        this.#qb.leftJoin(table, on);
+        return this;
+    }
+    /** RIGHT JOIN `table` on a `sql\`...\`` ON clause. */
+    rightJoin(table, on) {
+        this.#qb.rightJoin(table, on);
+        return this;
+    }
+    /** FULL OUTER JOIN `table` on a `sql\`...\`` ON clause. */
+    fullJoin(table, on) {
+        this.#qb.fullJoin(table, on);
+        return this;
+    }
+    // ---- WHERE ----
+    /** Add an AND condition — plain-object expression or `sql\`...\`` fragment. */
+    where(cond) {
+        this.#qb.where(cond);
+        return this;
+    }
+    /** Add an OR condition — same accepted shapes as `where()`. */
+    orWhere(cond) {
+        this.#qb.orWhere(cond);
+        return this;
+    }
+    /** Append a raw SQL fragment as an AND condition (no param binding). */
+    raw(fragment) {
+        this.#qb.raw(fragment);
+        return this;
+    }
+    // ---- GROUP / HAVING / ORDER ----
+    /** GROUP BY the given columns (quoted as identifiers). */
+    groupBy(...cols) {
+        this.#qb.groupBy(...cols);
+        return this;
+    }
+    /** HAVING condition on aggregated groups — same shapes as `where()`. */
+    having(cond) {
+        this.#qb.having(cond);
+        return this;
+    }
+    /** ORDER BY a column (quoted) or a `sql\`...\`` fragment, with direction. */
+    orderBy(col, dir = 'ASC') {
+        this.#qb.orderBy(col, dir);
+        return this;
+    }
+    /** LIMIT the number of returned rows (bound as a parameter). */
+    limit(n) {
+        this.#qb.limit(n);
+        return this;
+    }
+    /** OFFSET the result window (bound as a parameter; usually paired with `limit()`). */
+    offset(n) {
+        this.#qb.offset(n);
+        return this;
+    }
+    // ---- Build SQL (pure, synchronous) ----
+    /** Build only the WHERE clause (with params) — used for UPDATE/DELETE composition. */
+    buildWhere() {
+        return this.#qb.buildWhere();
+    }
+    /** Return the compiled SQL string and bound parameters. */
+    toSql() {
+        return this.#qb.toSql();
+    }
+    /** Compile the `first()` query (LIMIT 1 copy of the builder). Pure. */
+    buildFirstSql() {
+        return this.#qb.buildFirstSql();
+    }
+    /** Compile the `count()` query (COUNT(*) over the builder). Pure. */
+    buildCountSql() {
+        return this.#qb.buildCountSql();
+    }
+    /** Compile the `pluck(col)` query (projection copy of the builder). Pure. */
+    buildPluckSql(col) {
+        return this.#qb.buildPluckSql(col);
+    }
+    // ---- Execute (one RPC each) ----
+    /** Execute and return all matching rows. */
+    async all() {
+        const { sql, params } = this.toSql();
+        return this.#exec.all(sql, ...params);
+    }
+    /** Execute and return the first row, or undefined if none. */
+    async first() {
+        const { sql, params } = this.buildFirstSql();
+        return this.#exec.get(sql, ...params);
+    }
+    /** Execute the COUNT query. */
+    async count() {
+        const { sql, params } = this.buildCountSql();
+        const row = await this.#exec.get(sql, ...params);
+        return row?.c ?? 0;
+    }
+    /** Execute and return values of a single column. */
+    async pluck(col) {
+        const { sql, params } = this.buildPluckSql(col);
+        const rows = await this.#exec.all(sql, ...params);
+        return rows.map((r) => r[col]);
+    }
 }
+// ---------------------------------------------------------------------------
+// AsyncModel
+// ---------------------------------------------------------------------------
 /**
- * Asynchronously load migrations from a directory using `import()`.
+ * Async typed CRUD operations bound to a single table schema — the async
+ * mirror of `Model`, created via `AsyncSqlo#define(schema)`.
  *
- * Handles `.sql`, `.mjs`, `.js`, and `.cjs` files.
+ * Insert/read/update/delete methods are type-driven by the schema's row,
+ * insert, and patch types and share their SQL construction with the sync
+ * layer. Tables are created explicitly with `sync()` — never automatically.
+ * Every method returns a Promise; each call crosses the worker boundary once.
  */
-async function loadMigrations(dir) {
-    const absDir = resolve(dir);
-    const entries = (await readdir(absDir, { withFileTypes: true }))
-        .filter((e) => e.isFile())
-        .map((e) => e.name)
-        .sort();
-    const migrations = [];
-    for (const entry of entries) {
-        const ext = entry.split('.').pop()?.toLowerCase();
-        const name = entry.replace(/\.\w+$/, '');
-        const fullPath = resolve(absDir, entry);
-        if (ext === 'sql') {
-            const sql = await readFile(fullPath, 'utf-8');
-            migrations.push({ name, up: sql });
-        }
-        else if (ext === 'js' || ext === 'mjs' || ext === 'cjs') {
-            const absUrl = ext === 'cjs'
-                ? fullPath
-                : `file://${fullPath}`;
-            const mod = await import(absUrl);
-            const result = mod.default ?? mod;
-            if (Array.isArray(result)) {
-                migrations.push(...result);
-            }
-            else {
-                migrations.push(result);
-            }
+class AsyncModel {
+    #schema;
+    #exec;
+    table;
+    /**
+     * @param exec AsyncExecutor that executes prepared statements (an AsyncSqlo).
+     * @param schema The table definition that drives this model's types.
+     */
+    constructor(exec, schema) {
+        this.#exec = exec;
+        this.#schema = schema;
+        this.table = schema.name;
+    }
+    // ---- Schema sync ----
+    /**
+     * Create the table (and indexes) if they do not exist.
+     * Must be called explicitly — the ORM will not auto-create tables.
+     */
+    async sync() {
+        await this.#exec.exec(tableDDL(this.#schema));
+        for (const ddl of indexDDLs(this.#schema)) {
+            await this.#exec.exec(ddl);
         }
     }
-    return migrations;
+    // ---- INSERT ----
+    /**
+     * Insert a row and return the full row.
+     */
+    async insert(data) {
+        validateKeys(this.#schema, this.table, data);
+        const { sql, values, isEmpty } = buildInsertSql(this.#schema, this.table, data);
+        const result = await this.#exec.run(sql, ...values);
+        const rid = isEmpty ? await this.#lastInsertRowid() : result.lastInsertRowid;
+        const { sql: selSql, params } = resolveAfterInsertSql(this.#schema, this.table, data, rid);
+        return (await this.#exec.get(selSql, ...params));
+    }
+    /**
+     * Insert multiple rows atomically — either all succeed or none are kept.
+     *
+     * Wrapped in a transaction when the executor supports it (AsyncSqlo does).
+     * When called inside an outer `db.transaction(...)`, this nests via
+     * SAVEPOINT and participates in the outer commit/rollback.
+     *
+     * For very large batches, pass `{ chunkSize }` to insert in chunks — each
+     * chunk gets its own transaction (when not already inside an outer
+     * transaction), keeping write-lock hold time and memory bounded. Errors
+     * within a chunk roll back only that chunk; previously committed chunks
+     * stay.
+     */
+    async insertMany(rows, options) {
+        if (rows.length === 0)
+            return [];
+        const chunkSize = options?.chunkSize ?? rows.length;
+        const tx = this.#exec.transaction;
+        const results = [];
+        // Inside a transaction, insert through a model bound to the handle — the
+        // `db`-bound execution path is serialized behind the active transaction
+        // and would deadlock if used here.
+        const insertAll = async (exec, list) => {
+            const m = new AsyncModel(exec, this.#schema);
+            const out = [];
+            for (const r of list)
+                out.push(await m.insert(r));
+            return out;
+        };
+        if (chunkSize >= rows.length) {
+            // Single batch — keep the existing atomic behaviour.
+            if (tx) {
+                return (await this.#exec.transaction(async (t) => insertAll(t, rows)));
+            }
+            return insertAll(this.#exec, rows);
+        }
+        for (let i = 0; i < rows.length; i += chunkSize) {
+            const chunk = rows.slice(i, i + chunkSize);
+            if (tx) {
+                const inserted = (await this.#exec.transaction(async (t) => insertAll(t, chunk)));
+                results.push(...inserted);
+            }
+            else {
+                results.push(...(await insertAll(this.#exec, chunk)));
+            }
+        }
+        return results;
+    }
+    // ---- SELECT ----
+    /**
+     * Find a row by its primary key (first primaryKey column).
+     * Accepts number / bigint for INTEGER keys and string for TEXT/UUID keys.
+     */
+    async findById(id) {
+        const pkCols = pkColumns(this.#schema);
+        if (pkCols.length === 0) {
+            throw new Error(`Table "${this.table}" has no primary key column defined. Use findOne() instead.`);
+        }
+        const where = {};
+        where[pkCols[0]] = id;
+        return this.findOne(where);
+    }
+    /** Find a single row matching the condition. */
+    async findOne(where) {
+        const qb = this.query();
+        qb.where(where);
+        return qb.first();
+    }
+    /** Find all rows matching the optional condition. */
+    async findAll(where) {
+        const qb = this.query();
+        if (where !== undefined)
+            qb.where(where);
+        return qb.all();
+    }
+    /** Convenience: alias for findAll(). */
+    async all() {
+        return this.findAll();
+    }
+    // ---- UPDATE ----
+    /**
+     * Update rows matching the condition. Returns the number of affected rows.
+     * The `where` argument is required.
+     */
+    async update(patch, where) {
+        validateKeys(this.#schema, this.table, patch);
+        const patchKeys = Object.keys(patch);
+        if (patchKeys.length === 0)
+            return 0;
+        const setClause = patchKeys.map((k) => `${quoteIdent(k)} = ?`).join(', ');
+        const patchValues = Object.values(patch);
+        const qb = new QueryBuilder(UNREACHABLE_EXECUTOR, this.table);
+        qb.where(where);
+        const { clause, params } = qb.buildWhere();
+        if (!clause) {
+            throw new Error('update() requires a WHERE condition. Use db.exec() for bulk updates.');
+        }
+        const result = await this.#exec.run(`UPDATE ${quoteIdent(this.table)} SET ${setClause}${clause}`, ...patchValues, ...params);
+        return Number(result.changes);
+    }
+    // ---- DELETE ----
+    /**
+     * Delete rows matching the condition. Returns the number of deleted rows.
+     * The `where` argument is required.
+     */
+    async delete(where) {
+        const qb = new QueryBuilder(UNREACHABLE_EXECUTOR, this.table);
+        qb.where(where);
+        const { clause, params } = qb.buildWhere();
+        if (!clause) {
+            throw new Error('delete() requires a WHERE condition. Use db.exec() for bulk deletes.');
+        }
+        const result = await this.#exec.run(`DELETE FROM ${quoteIdent(this.table)}${clause}`, ...params);
+        return Number(result.changes);
+    }
+    /**
+     * Delete all rows in the table. Returns the number of deleted rows.
+     * Explicit escape hatch — unlike `delete()`, no WHERE is required.
+     */
+    async deleteAll() {
+        const result = await this.#exec.run(`DELETE FROM ${quoteIdent(this.table)}`);
+        return Number(result.changes);
+    }
+    // ---- COUNT / EXISTS ----
+    /** Count rows matching the optional condition. */
+    async count(where) {
+        const qb = this.query();
+        if (where !== undefined)
+            qb.where(where);
+        return qb.count();
+    }
+    /** Check if at least one row matches the condition (LIMIT 1 query). */
+    async exists(where) {
+        return (await this.findOne(where)) !== undefined;
+    }
+    // ---- Query builder ----
+    /** Get a fluent AsyncQueryBuilder for this table. */
+    query() {
+        return new AsyncQueryBuilder(this.#exec, this.table);
+    }
+    /**
+     * Return a copy of this model bound to a different executor (e.g. an
+     * `AsyncTransaction` handle), keeping the exact same type. Use it inside a
+     * transaction callback via `tx.model(...)`.
+     */
+    withExecutor(exec) {
+        return new AsyncModel(exec, this.#schema);
+    }
+    // ---- Internal ----
+    async #lastInsertRowid() {
+        const row = await this.#exec.get('SELECT last_insert_rowid() AS "rid"');
+        return row?.rid ?? 0;
+    }
 }
 
 /**
@@ -2307,6 +2775,14 @@ async function loadMigrations(dir) {
  * The underlying SQLite is still synchronous.  Using the async wrapper
  * only avoids event‑loop blocking — it does not make SQLite concurrent.
  * SQLite's single‑writer lock still applies.
+ *
+ * Architecture — "brain on the main thread, hands in the worker":
+ * The main thread owns all types and query construction (pure functions,
+ * zero blocking); the worker is a remote connection that only executes
+ * final SQL. `define` / models / the query builder live on the main thread
+ * and mirror the sync API exactly; every terminal call is a single RPC.
+ * Only execution crosses the worker boundary, so the sync and async layers
+ * share one place that knows how a query is built.
  */
 const __filename$1 = fileURLToPath(import.meta.url);
 const __dirname$1 = dirname(__filename$1);
@@ -2321,19 +2797,44 @@ const __dirname$1 = dirname(__filename$1);
  * single-writer. `AsyncSqlo` only avoids event-loop blocking — it does not
  * make SQLite concurrent, and multi-process writes still surface as lock
  * timeout errors.
+ *
+ * Mirrors the synchronous `Sqlo` API for schema (`define` / `syncAll`),
+ * models (`AsyncModel`), transactions, and migrations. Query construction
+ * stays on the main thread; only execution crosses to the worker.
  */
 class AsyncSqlo {
     #worker;
     #pending = new Map();
+    #models = new Map();
     #nextId = 1;
     /**
+     * Tail of the FIFO dispatch lane. Every operation (exec/all/get/run,
+     * backup, close) and every transaction is enqueued onto this chain, so a
+     * transaction is an indivisible block — BEGIN → fn(tx) → COMMIT cannot be
+     * interleaved with any other operation. This restores the guarantee the
+     * sync `Sqlo` gets for free (the blocked event loop makes concurrent
+     * interleaving impossible) and prevents two concurrent `transaction()`
+     * calls from being merged into one physical transaction.
+     */
+    #tail = Promise.resolve();
+    #fkEnabled;
+    /**
      * @param path Database file path (or `':memory:'`) opened inside the worker.
-     * @param options Options forwarded to the worker's `DatabaseSync` constructor.
+     * @param options Options forwarded to the worker's `DatabaseSync`
+     *   constructor. Foreign-key enforcement defaults to `true` (matching the
+     *   synchronous `Sqlo`), so `define()` can warn when it is disabled while
+     *   the schema declares references.
      */
     constructor(path, options) {
+        // Align the foreign-key default with the sync Sqlo (#60): enforcement is
+        // ON by default. Pass the resolved flag to the worker's DatabaseSync and
+        // remember it here for the define() warning.
+        const fkEnabled = options?.enableForeignKeyConstraints !== false;
+        this.#fkEnabled = fkEnabled;
+        const workerOptions = { ...options, enableForeignKeyConstraints: fkEnabled };
         const workerPath = resolve(__dirname$1, 'async-worker.js');
         this.#worker = new Worker(workerPath, {
-            workerData: { path, options },
+            workerData: { path, options: workerOptions },
         });
         this.#worker.on('message', (msg) => {
             const pending = this.#pending.get(msg.id);
@@ -2344,10 +2845,17 @@ class AsyncSqlo {
                 pending.resolve(msg.data);
             }
             else {
+                // Rebuild the SQLite error carrying errcode/errstr so the main thread
+                // can classify it with isBusyError / isConstraintError — postMessage
+                // would otherwise strip the extended result codes.
                 const err = new Error(msg.error?.message ?? 'Unknown worker error');
                 err.name = msg.error?.name ?? 'Error';
                 if (msg.error?.stack)
                     err.stack = msg.error.stack;
+                if (typeof msg.error?.errcode === 'number')
+                    err.errcode = msg.error.errcode;
+                if (typeof msg.error?.errstr === 'string')
+                    err.errstr = msg.error.errstr;
                 pending.reject(err);
             }
         });
@@ -2368,7 +2876,13 @@ class AsyncSqlo {
             }
         });
     }
-    // ---- Methods ----
+    // ---- Dispatch lane ----
+    #enqueue(task) {
+        const run = this.#tail.then(task);
+        // Keep the chain alive even when a task rejects.
+        this.#tail = run.then(() => undefined, () => undefined);
+        return run;
+    }
     #send(op, sql, params = []) {
         return new Promise((resolve, reject) => {
             const id = this.#nextId++;
@@ -2380,19 +2894,19 @@ class AsyncSqlo {
      * Execute a SQL string (no return value).
      */
     exec(sql) {
-        return this.#send('exec', sql);
+        return this.#enqueue(() => this.#send('exec', sql));
     }
     /**
      * Execute and return all rows.
      */
     all(sql, ...params) {
-        return this.#send('all', sql, params);
+        return this.#enqueue(() => this.#send('all', sql, params));
     }
     /**
      * Execute and return the first row, or undefined.
      */
     get(sql, ...params) {
-        return this.#send('get', sql, params);
+        return this.#enqueue(() => this.#send('get', sql, params));
     }
     /**
      * Execute and return { changes, lastInsertRowid }.
@@ -2401,13 +2915,210 @@ class AsyncSqlo {
      * large integers — coerce with `Number()` if you need a plain number.
      */
     run(sql, ...params) {
-        return this.#send('run', sql, params);
+        return this.#enqueue(() => this.#send('run', sql, params));
+    }
+    // ---- Schema & Model ----
+    /**
+     * Define a model for a table — the async mirror of `Sqlo#define`.
+     *
+     * ```ts
+     * const users = await db.define({
+     *   name: 'users',
+     *   columns: {
+     *     id: { type: 'INTEGER', primaryKey: true, autoIncrement: true },
+     *     name: { type: 'TEXT', notNull: true },
+     *   },
+     * });
+     * ```
+     *
+     * Does **not** create the table — call `users.sync()` or `db.syncAll()`.
+     */
+    define(schema) {
+        // Validate the schema
+        const { errors, warnings } = validateSchema(schema);
+        if (errors.length > 0) {
+            throw new Error(`Invalid schema for table "${schema.name}":\n  ${errors.join('\n  ')}`);
+        }
+        for (const warning of warnings) {
+            process.emitWarning(warning, { code: 'SQLO_SCHEMA_WARNING' });
+        }
+        // Foreign keys: warn when the schema declares references but the
+        // connection has foreign-key enforcement disabled — the declared
+        // ON DELETE / ON UPDATE actions would silently not fire.
+        if (!this.#fkEnabled && schemaHasReferences(schema)) {
+            process.emitWarning(`Table "${schema.name}" declares foreign key references but the connection has ` +
+                'foreign key enforcement disabled (enableForeignKeyConstraints: false). ' +
+                'ON DELETE / ON UPDATE actions will NOT fire. Enable the option to enforce them.', { code: 'SQLO_FOREIGN_KEYS_DISABLED' });
+        }
+        const model = new AsyncModel(this, schema);
+        this.#models.set(schema.name, model);
+        return model;
     }
     /**
-     * Close the worker and its database connection.
+     * Create all defined tables and indexes.
+     */
+    async syncAll() {
+        for (const model of this.#models.values()) {
+            await model.sync();
+        }
+    }
+    // ---- Transaction ----
+    /**
+     * Run a function inside a transaction — the async mirror of
+     * `Sqlo#transaction`. The callback receives an explicit transaction handle
+     * (`tx`); every operation performed through it runs inside the transaction
+     * and cannot be interleaved with other operations.
+     *
+     * ```ts
+     * await db.transaction(async (tx) => {
+     *   const u = tx.model(users); // type-safe copy bound to the transaction
+     *   await u.update({ balance: 0 }, { id });
+     *   await tx.run('UPDATE ledger SET amount = ? WHERE id = ?', 100, 1);
+     * });
+     * ```
+     *
+     * Nested transactions are available on the handle:
+     * `tx.transaction(async (inner) => { ... })` — they use SAVEPOINT / RELEASE
+     * in the worker and share the outer transaction's fate.
+     *
+     * Production concurrency: SQLite is single-writer, so concurrent writers can
+     * hit `SQLITE_BUSY`. Pass `{ retry: n }` to automatically re-run the whole
+     * transaction (from a fresh `BEGIN`) with exponential backoff when the
+     * database is locked. The backoff uses a real `setTimeout` sleep (unlike the
+     * sync API's busy-wait). Other errors propagate immediately. Retries only
+     * apply to top-level transactions — a nested (SAVEPOINT) transaction belongs
+     * to an outer one and is never retried.
+     */
+    async transaction(fn, options) {
+        let attempt = 0;
+        const maxRetries = options?.retry ?? 0;
+        for (;;) {
+            try {
+                // Enqueue the whole transaction as one indivisible block so it can
+                // never be interleaved with concurrent operations or transactions.
+                return await this.#enqueue(() => this.#transactionOnce(fn));
+            }
+            catch (err) {
+                if (!isBusyError(err) || attempt >= maxRetries)
+                    throw err;
+                attempt++;
+                // Exponential backoff: 50ms, 100ms, 200ms, ... as a real sleep.
+                // While sleeping, the dispatch lane is free for other requests.
+                const delay = 50 * 2 ** (attempt - 1);
+                await new Promise((r) => setTimeout(r, delay));
+            }
+        }
+    }
+    async #transactionOnce(fn) {
+        await this.#send('txBegin', '');
+        const tx = this.#makeTransaction();
+        try {
+            const result = await fn(tx);
+            await this.#send('txCommit', '');
+            return result;
+        }
+        catch (err) {
+            await this.#send('txRollback', '');
+            throw err;
+        }
+    }
+    /**
+     * Build the explicit transaction handle. Operations on the handle dispatch
+     * directly to the worker (bypassing the FIFO lane) because the enclosing
+     * transaction already holds the lane — the worker processes them serially
+     * and inside the open transaction. Nested `tx.transaction(...)` recurse
+     * into `#transactionOnce`, which the worker turns into a SAVEPOINT.
+     */
+    #makeTransaction() {
+        const owner = this;
+        const tx = {
+            exec: (sql) => owner.#send('exec', sql),
+            all: (sql, ...params) => owner.#send('all', sql, params),
+            get: (sql, ...params) => owner.#send('get', sql, params),
+            run: (sql, ...params) => owner.#send('run', sql, params),
+            transaction: (fn) => owner.#transactionOnce(fn),
+            model: (m) => m.withExecutor(tx),
+        };
+        return tx;
+    }
+    // ---- Migration ----
+    /**
+     * Run pending migrations — the async mirror of `Sqlo#migrate`. Returns the
+     * list of newly applied migrations.
+     *
+     * Reuses the same pure migration SQL as the sync layer (version table,
+     * applied lookup, pending computation). Each migration runs in its own
+     * transaction through the worker's transaction primitives, so already
+     * applied migrations survive a later failure.
+     *
+     * Pass `{ schema: 'aux' }` to manage the migrations of an attached
+     * database — the version table is created inside that schema.
+     */
+    async migrate(migrations, options) {
+        const schema = options?.schema ?? 'main';
+        await this.exec(ensureMigrationTableSql(schema));
+        const rows = await this.all(getAppliedMigrationsSql(schema));
+        const applied = new Map();
+        for (const row of rows)
+            applied.set(row.name, row.applied_at);
+        const pending = computePending(migrations, applied);
+        for (const m of pending) {
+            try {
+                await this.transaction(async (tx) => {
+                    await this.#applyMigration(tx, m, schema);
+                });
+            }
+            catch (err) {
+                throw new Error(`Migration "${m.name}" failed. DB has been rolled back.`, { cause: err });
+            }
+        }
+        return pending;
+    }
+    async #applyMigration(tx, m, schema) {
+        const ts = new Date().toISOString();
+        if (typeof m.up === 'string') {
+            await tx.exec(m.up);
+        }
+        else {
+            await m.up({ exec: async (sql) => { await tx.exec(sql); } });
+        }
+        await tx.run(insertMigrationRecordSql(schema), m.name, ts);
+    }
+    /**
+     * List all migrations with their applied status — the async mirror of
+     * `Sqlo#migrationStatus`. Pass `{ schema }` to inspect an attached
+     * database's migration history.
+     */
+    async migrationStatus(migrations, options) {
+        const schema = options?.schema ?? 'main';
+        await this.exec(ensureMigrationTableSql(schema));
+        const rows = await this.all(getAppliedMigrationsSql(schema));
+        const applied = new Map();
+        for (const row of rows)
+            applied.set(row.name, row.applied_at);
+        return migrations.map((m) => ({
+            name: m.name,
+            appliedAt: applied.get(m.name) ?? null,
+        }));
+    }
+    // ---- Backup ----
+    /**
+     * Create an online backup of the database to another file — the async
+     * mirror of `Sqlo#backup`. Uses SQLite's `VACUUM INTO`, which takes a
+     * consistent snapshot even while the database is in use.
+     *
+     * @param target File path of the backup to create.
+     */
+    backup(target) {
+        return this.#enqueue(() => this.#send('backup', target));
+    }
+    // ---- Close ----
+    /**
+     * Close the worker and its database connection. Waits for all queued
+     * operations (including any running transaction) to finish first.
      */
     close() {
-        return this.#send('close', '');
+        return this.#enqueue(() => this.#send('close', ''));
     }
     /**
      * Terminate the worker immediately (without graceful shutdown).
@@ -2417,5 +3128,5 @@ class AsyncSqlo {
     }
 }
 
-export { AsyncSqlo, Model, MultiSqlo, QueryBuilder, SQLITE, Sqlo, columnDDL, generateMigrationSql, indexDDLs, isBusyError, isConstraintError, isFragment, isIdent, loadMigrations, loadMigrationsSync, loadTableDefSync, quoteIdent, quoteTable, raw, reflectTableSchema, schemaDiff, sql, tableDDL };
+export { AsyncModel, AsyncQueryBuilder, AsyncSqlo, Model, MultiSqlo, QueryBuilder, SQLITE, Sqlo, columnDDL, generateMigrationSql, indexDDLs, isBusyError, isConstraintError, isFragment, isIdent, loadMigrations, loadMigrationsSync, loadTableDefSync, quoteIdent, quoteTable, raw, reflectTableSchema, schemaDiff, sql, tableDDL };
 //# sourceMappingURL=index.js.map

@@ -73,3 +73,30 @@ test('define rejects a schema with no columns', () => {
   );
   db.close();
 });
+
+test('prepare returns a statement handle with all / get / run', () => {
+  const db = new Sqlo({ path: ':memory:' });
+  try {
+    db.exec('CREATE TABLE t_prep (id INTEGER PRIMARY KEY, name TEXT)');
+
+    const ins = db.prepare('INSERT INTO t_prep (name) VALUES (?)');
+    const r1 = ins.run('a');
+    const r2 = ins.run('b');
+    assert.equal(Number(r1.changes), 1);
+    assert.equal(Number(r2.changes), 1);
+
+    const sel = db.prepare('SELECT * FROM t_prep ORDER BY id');
+    assert.deepEqual(sel.all(), [
+      { id: 1, name: 'a' },
+      { id: 2, name: 'b' },
+    ]);
+
+    const one = db.prepare('SELECT * FROM t_prep WHERE id = ?').get(2);
+    assert.deepEqual(one, { id: 2, name: 'b' });
+
+    const missing = db.prepare('SELECT * FROM t_prep WHERE id = ?').get(99);
+    assert.equal(missing, undefined);
+  } finally {
+    db.close();
+  }
+});

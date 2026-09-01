@@ -265,6 +265,48 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
     return { sql: parts.join(' '), params };
   }
 
+  // ---- Build helpers (terminal SQL, not executed) ----
+
+  /**
+   * Compile the `first()` query — a LIMIT 1 copy of the current builder.
+   * Pure: does not mutate the builder and never executes. Shared with the
+   * async `AsyncQueryBuilder`, which reuses the exact same SQL.
+   */
+  buildFirstSql(): { sql: string; params: unknown[] } {
+    return this.#clone().limit(1).toSql();
+  }
+
+  /**
+   * Compile the `count()` query — COUNT(*) over the current builder.
+   * Pure: never executes. Shared with the async `AsyncQueryBuilder`.
+   */
+  buildCountSql(): { sql: string; params: unknown[] } {
+    const params: unknown[] = [];
+    let countSql: string;
+
+    if (this.#s.groupBys.length > 0 || this.#s.joins.length > 0) {
+      // Wrap in subquery to handle GROUP BY / JOIN row multiplication
+      const inner = this.toSql();
+      countSql = `SELECT COUNT(*) AS "c" FROM (${inner.sql})`;
+      params.push(...inner.params);
+    } else {
+      countSql = `SELECT COUNT(*) AS "c" FROM ${quoteTable(this.#s.table)}`;
+      const whereClause = this.#buildWhereClauses(this.#s.whereGroups, params);
+      if (whereClause) countSql += ` ${whereClause}`;
+    }
+
+    return { sql: countSql, params };
+  }
+
+  /**
+   * Compile the `pluck(col)` query — a SELECT of a single column copy of the
+   * current builder. Pure: never executes. Shared with the async
+   * `AsyncQueryBuilder`.
+   */
+  buildPluckSql<C extends keyof Row>(col: C): { sql: string; params: unknown[] } {
+    return this.#clone().select(col as string).toSql();
+  }
+
   // ---- Execute ----
 
   /**
@@ -282,30 +324,17 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
    * copy, so the builder stays reusable afterwards.
    */
   first(): Row | undefined {
-    const q = this.#clone().limit(1).toSql();
-    const stmt = this.#exec.prepare(q.sql);
-    return stmt.get(...q.params) as Row | undefined;
+    const { sql, params } = this.buildFirstSql();
+    const stmt = this.#exec.prepare(sql);
+    return stmt.get(...params) as Row | undefined;
   }
 
   /**
    * Execute COUNT query.
    */
   count(): number {
-    const params: unknown[] = [];
-    let countSql: string;
-
-    if (this.#s.groupBys.length > 0 || this.#s.joins.length > 0) {
-      // Wrap in subquery to handle GROUP BY / JOIN row multiplication
-      const inner = this.toSql();
-      countSql = `SELECT COUNT(*) AS "c" FROM (${inner.sql})`;
-      params.push(...inner.params);
-    } else {
-      countSql = `SELECT COUNT(*) AS "c" FROM ${quoteTable(this.#s.table)}`;
-      const whereClause = this.#buildWhereClauses(this.#s.whereGroups, params);
-      if (whereClause) countSql += ` ${whereClause}`;
-    }
-
-    const stmt = this.#exec.prepare(countSql);
+    const { sql, params } = this.buildCountSql();
+    const stmt = this.#exec.prepare(sql);
     const row = stmt.get(...params) as { c: number } | undefined;
     return row?.c ?? 0;
   }
@@ -315,7 +344,7 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
    * Does not mutate the builder — projection is applied on a copy.
    */
   pluck<C extends keyof Row>(col: C): Row[C][] {
-    const { sql, params } = this.#clone().select(col as string).toSql();
+    const { sql, params } = this.buildPluckSql(col);
     const stmt = this.#exec.prepare(sql);
     const rows = stmt.all(...params) as Row[];
     return rows.map((r) => r[col]);
