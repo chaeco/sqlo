@@ -130,3 +130,10 @@ test('nested transactions are never retried', () => {
   assert.equal(innerCalls, 1, 'nested transaction must not be retried');
   db.close();
 });
+
+test('isBusyError() message fallback matches only the SQLITE_BUSY text', () => {
+  // SQLITE_LOCKED surfaces as "table X is locked" — without an errcode we
+  // must not classify it as BUSY.
+  assert.equal(isBusyError(new Error('table users is locked')), false);
+  assert.equal(isBusyError(new Error('database is locked')), true);
+});

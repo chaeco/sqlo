@@ -5,8 +5,8 @@
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createDb, userSchema, postSchema } from './helpers.ts';
-import { Sqlo, sql } from '../src/index.ts';
-import type { Model, RowOf, InsertOf, PatchOf } from '../src/index.ts';
+import { Model, Sqlo, sql } from '../src/index.ts';
+import type { RowOf, InsertOf, PatchOf } from '../src/index.ts';
 
 type Users = Model<RowOf<typeof userSchema>, InsertOf<typeof userSchema>, PatchOf<typeof userSchema>>;
 type Posts = Model<RowOf<typeof postSchema>, InsertOf<typeof postSchema>, PatchOf<typeof postSchema>>;
@@ -389,5 +389,183 @@ describe('Sqlo options', () => {
     const all = sDb.all('SELECT * FROM t');
     assert.deepEqual(all, []);
     sDb.close();
+  });
+});
+describe('input robustness', () => {
+  it('insertMany rejects non-positive chunkSize instead of hanging', () => {
+    assert.throws(
+      () => users.insertMany([{ name: 'a', email: 'a@x' }], { chunkSize: 0 }),
+      /chunkSize must be a positive integer/,
+    );
+    assert.throws(
+      () => users.insertMany([{ name: 'a', email: 'a@x' }], { chunkSize: -1 }),
+      /chunkSize must be a positive integer/,
+    );
+    assert.throws(
+      () => users.insertMany([{ name: 'a', email: 'a@x' }], { chunkSize: 1.5 }),
+      /chunkSize must be a positive integer/,
+    );
+    // Nothing was inserted by the failed calls.
+    assert.equal(users.count(), 0);
+  });
+
+  it('treats explicit undefined insert values as absent columns', () => {
+    // Runtime JS callers can pass explicit undefined (exactOptionalPropertyTypes
+    // forbids it in TS, so cast): it must be treated as "not provided".
+    const data: Record<string, unknown> = { name: 'u', email: 'u@x', age: undefined };
+    const row = users.insert(data as Parameters<typeof users.insert>[0]);
+    assert.equal(row.age, null);
+  });
+
+  it('update skips undefined patch values (never binds them)', () => {
+    const created = users.insert({ name: 'u', email: 'u@x', age: 30 });
+    const changed = users.update({ age: undefined, name: 'renamed' }, { id: created.id });
+    assert.equal(changed, 1);
+    const after = users.findById(created.id);
+    assert.equal(after!.name, 'renamed');
+    assert.equal(after!.age, 30, 'undefined patch value must not touch the column');
+  });
+
+  it('update with only undefined values is a no-op returning 0', () => {
+    const created = users.insert({ name: 'u', email: 'u@x', age: 30 });
+    const changed = users.update({ age: undefined }, { id: created.id });
+    assert.equal(changed, 0);
+  });
+
+  it('in/between operators reject invalid input with clear errors', () => {
+    assert.throws(
+      () => users.findAll({ age: { in: 'oops' as unknown as number[] } }),
+      /Where operator "in" requires an array/,
+    );
+    assert.throws(
+      () => users.findAll({ age: { between: [1] as unknown as [number, number] } }),
+      /exactly 2 elements/,
+    );
+  });
+});
+
+describe('transaction misuse & binding edge cases', () => {
+  it('transaction() rejects async callbacks instead of committing early', async () => {
+    db.exec('CREATE TABLE tx_async (id INTEGER)');
+    assert.throws(
+      () => db.transaction(async () => {
+        db.run('INSERT INTO tx_async (id) VALUES (1)');
+        await new Promise((r) => setTimeout(r, 10));
+        db.run('INSERT INTO tx_async (id) VALUES (2)');
+      }),
+      /async callback/,
+    );
+    // The pre-await insert was rolled back with the transaction — the old
+    // behaviour silently committed it.
+    assert.equal(db.all('SELECT * FROM tx_async').length, 0);
+    // Let the detached async continuation finish against this still-open db
+    // (so it doesn't leak into the next test) and confirm it ran OUTSIDE the
+    // transaction, in autocommit mode.
+    await new Promise((r) => setTimeout(r, 30));
+    assert.equal(db.all('SELECT * FROM tx_async').length, 1, 'post-await write ran outside the transaction');
+  });
+
+  it('binds booleans as 1/0', () => {
+    db.exec('CREATE TABLE bools (id INTEGER PRIMARY KEY, flag INTEGER)');
+    db.run('INSERT INTO bools (id, flag) VALUES (?, ?)', 1, true);
+    assert.equal(db.get('SELECT flag FROM bools WHERE id = 1')!.flag, 1);
+    assert.equal(db.all('SELECT id FROM bools WHERE flag = ?', true).length, 1);
+    assert.equal(db.all('SELECT id FROM bools WHERE flag = ?', false).length, 0);
+  });
+
+  it('model insert/update accept booleans on BOOLEAN-typed columns', () => {
+    const boolModel = db.define({
+      name: 'bool_rows',
+      columns: {
+        id: { type: 'INTEGER', primaryKey: true, autoIncrement: true },
+        flag: { type: 'BOOLEAN' },
+      },
+    });
+    boolModel.sync();
+    const row = boolModel.insert({ flag: true as unknown as number });
+    assert.equal(row.flag, 1);
+    boolModel.update({ flag: false as unknown as number }, { id: row.id });
+    assert.equal(boolModel.findById(row.id)!.flag, 0);
+  });
+});
+
+describe('insertMany without transaction support', () => {
+  function bareExecutor() {
+    // An Executor without `transaction` — Model must fall back to plain inserts.
+    return { prepare: (stmt: string) => db.prepare(stmt) };
+  }
+
+  it('inserts a single batch without a transaction-capable executor', () => {
+    const plain = new Model(bareExecutor(), userSchema);
+    const rows = plain.insertMany([
+      { name: 'n1', email: 'n1@x' },
+      { name: 'n2', email: 'n2@x' },
+    ]);
+    assert.equal(rows.length, 2);
+    assert.equal(users.count(), 2);
+  });
+
+  it('chunks without a transaction-capable executor', () => {
+    const plain = new Model(bareExecutor(), userSchema);
+    const rows = plain.insertMany(
+      [1, 2, 3].map((i) => ({ name: `c${i}`, email: `c${i}@x` })),
+      { chunkSize: 2 },
+    );
+    assert.equal(rows.length, 3);
+    assert.equal(users.count(), 3);
+  });
+});
+
+describe('define() validation error branches', () => {
+  it('rejects duplicate index names', () => {
+    assert.throws(
+      () => db.define({
+        name: 'dup_idx',
+        columns: { id: { type: 'INTEGER' } },
+        indexes: [
+          { name: 'ix', columns: ['id'] },
+          { name: 'ix', columns: ['id'] },
+        ],
+      }),
+      /Duplicate index name/,
+    );
+  });
+
+  it('rejects indexes with no columns', () => {
+    assert.throws(
+      () => db.define({
+        name: 'empty_idx',
+        columns: { id: { type: 'INTEGER' } },
+        indexes: [{ name: 'ix', columns: [] }],
+      }),
+      /has no columns/,
+    );
+  });
+
+  it('rejects invalid foreign-key actions', () => {
+    assert.throws(
+      () => db.define({
+        name: 'bad_ref',
+        columns: {
+          id: { type: 'INTEGER' },
+          otherId: {
+            type: 'INTEGER',
+            references: { table: 'other', column: 'id', onDelete: 'EXPLODE' as unknown as 'CASCADE' },
+          },
+        },
+      }),
+      /invalid onDelete/,
+    );
+  });
+
+  it('rejects parameterized partial-index WHERE at define time', () => {
+    assert.throws(
+      () => db.define({
+        name: 'param_idx',
+        columns: { id: { type: 'INTEGER' }, flag: { type: 'INTEGER' } },
+        indexes: [{ name: 'ix', columns: ['id'], where: sql`flag = ${1}` }],
+      }),
+      /WHERE clause cannot contain bound parameters/,
+    );
   });
 });

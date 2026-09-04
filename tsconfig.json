@@ -17,6 +17,7 @@
     "isolatedModules": true,
     "skipLibCheck": true,
     "allowImportingTsExtensions": true,
+    "noEmit": true,
     "types": ["node"]
   },
   "include": ["src/**/*.ts", "test/**/*.ts"],

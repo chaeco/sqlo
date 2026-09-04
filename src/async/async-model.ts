@@ -63,8 +63,9 @@ export interface AsyncExecutor {
  * The explicit transaction handle handed to a transaction callback.
  *
  * All operations performed through the handle are guaranteed to run inside
- * the transaction (the handle dispatches directly to the worker — it cannot
- * be interleaved with other operations). Pass an existing model to
+ * the transaction (the handle dispatches directly to the worker). Operations
+ * on `db`-bound executors issued while the transaction is open join the same
+ * transaction. Pass an existing model to
  * {@link AsyncTransaction#model} to get a copy bound to this transaction:
  *
  * ```ts
@@ -272,8 +273,10 @@ export class AsyncQueryBuilder<Row extends Record<string, unknown> = Record<stri
   /** Execute the COUNT query. */
   async count(): Promise<number> {
     const { sql, params } = this.buildCountSql();
-    const row = await this.#exec.get<{ c: number }>(sql, ...params);
-    return row?.c ?? 0;
+    const row = await this.#exec.get<{ c: number | bigint }>(sql, ...params);
+    // Coerce: with readBigInts the driver returns a bigint — COUNT fits a
+    // safe integer in realistic use, surface a plain number.
+    return row?.c === undefined ? 0 : Number(row.c);
   }
 
   /** Execute and return values of a single column. */
@@ -355,6 +358,11 @@ export class AsyncModel<Row extends Record<string, unknown>, Insert, Patch> {
   async insertMany(rows: Insert[], options?: { chunkSize?: number }): Promise<Row[]> {
     if (rows.length === 0) return [];
     const chunkSize = options?.chunkSize ?? rows.length;
+    if (!Number.isInteger(chunkSize) || chunkSize < 1) {
+      throw new Error(
+        `insertMany: chunkSize must be a positive integer, got ${options?.chunkSize}.`,
+      );
+    }
     const tx = this.#exec.transaction;
     const results: Row[] = [];
 
@@ -433,11 +441,16 @@ export class AsyncModel<Row extends Record<string, unknown>, Insert, Patch> {
    */
   async update(patch: Patch, where: WhereExpr<Partial<Row>> | SqlFragment): Promise<number> {
     validateKeys(this.#schema, this.table, patch);
-    const patchKeys = Object.keys(patch as Record<string, unknown>);
+    // Explicit `undefined` means "not patched" (matching the PatchOf type) —
+    // never bind it, node:sqlite would reject it with an opaque TypeError.
+    const patchEntries = Object.entries(patch as Record<string, unknown>).filter(
+      ([, v]) => v !== undefined,
+    );
+    const patchKeys = patchEntries.map(([k]) => k);
     if (patchKeys.length === 0) return 0;
 
     const setClause = patchKeys.map((k) => `${quoteIdent(k)} = ?`).join(', ');
-    const patchValues = Object.values(patch as Record<string, unknown>);
+    const patchValues = patchEntries.map(([, v]) => v);
 
     const qb = new QueryBuilder<Row>(UNREACHABLE_EXECUTOR, this.table);
     qb.where(where as WhereExpr<Row>);

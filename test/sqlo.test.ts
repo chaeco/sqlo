@@ -100,3 +100,31 @@ test('prepare returns a statement handle with all / get / run', () => {
     db.close();
   }
 });
+test('open: false defers opening; open() activates and reopens the connection', () => {
+  const dbPath = join(tmpdir(), `sqlo-openflag-${Date.now()}-${Math.random().toString(16).slice(2)}.db`);
+  const db = new Sqlo({ path: dbPath, open: false });
+  assert.throws(() => db.all('SELECT 1'), /not open/);
+
+  db.open();
+  db.exec('CREATE TABLE t (id INTEGER)');
+  db.run('INSERT INTO t (id) VALUES (1)');
+  db.close();
+
+  // close() then open() reopens at the constructor path; file data persists.
+  db.open();
+  assert.equal(db.all('SELECT * FROM t').length, 1);
+  db.open(); // idempotent on an already-open connection
+  assert.equal(db.all('SELECT * FROM t').length, 1);
+  db.close();
+  rmSync(dbPath, { force: true });
+});
+
+test('enableDoubleQuotedStringLiterals passes through to node:sqlite', () => {
+  const on = new Sqlo({ path: ':memory:', enableDoubleQuotedStringLiterals: true });
+  assert.equal(on.get('SELECT "hello" AS v')!.v, 'hello');
+  on.close();
+
+  const off = new Sqlo({ path: ':memory:' });
+  assert.throws(() => off.get('SELECT "hello" AS v'), /no such column/i);
+  off.close();
+});

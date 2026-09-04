@@ -18,6 +18,7 @@ import {
 } from '../migration/migration';
 import { isBusyError } from './error';
 import { shouldLog, type LogEntry, type LogLevel, type LogEvent } from './logging';
+import { toBindables } from './bind';
 
 // ---------------------------------------------------------------------------
 // SqloOptions
@@ -48,6 +49,11 @@ export interface SqloOptions {
   enableForeignKeyConstraints?: boolean;
   enableDoubleQuotedStringLiterals?: boolean;
   allowExtension?: boolean;
+  /**
+   * Busy timeout in ms for `PRAGMA busy_timeout` — how long a statement waits
+   * for the write lock before failing with SQLITE_BUSY. Defaults to 5000ms
+   * (matching the README); pass `0` for SQLite's raw fail-fast behaviour.
+   */
   busyTimeout?: number;
   /**
    * Journal mode applied via `PRAGMA journal_mode` on open.
@@ -120,7 +126,11 @@ export class Sqlo implements Executor {
       enableForeignKeyConstraints: opts.enableForeignKeyConstraints ?? true,
       enableDoubleQuotedStringLiterals: opts.enableDoubleQuotedStringLiterals ?? false,
       allowExtension: opts.allowExtension ?? false,
-      busyTimeout: opts.busyTimeout ?? 0,
+      // 5000ms — the README-documented default and the production-sane choice:
+      // SQLite's own default is 0, which makes any concurrent writer fail
+      // with SQLITE_BUSY instantly. Callers who want the raw fail-fast
+      // behaviour can pass `busyTimeout: 0` explicitly.
+      busyTimeout: opts.busyTimeout ?? 5000,
       journalMode: opts.journalMode ?? 'DELETE',
       logLevel: opts.logLevel ?? 'warn',
       ...(opts.onLog !== undefined ? { onLog: opts.onLog } : {}),
@@ -134,16 +144,18 @@ export class Sqlo implements Executor {
       allowExtension: this.#options.allowExtension,
     });
 
-    if (this.#options.busyTimeout > 0) {
-      this.#db.exec(`PRAGMA busy_timeout = ${this.#options.busyTimeout}`);
-    }
-    if (opts.journalMode !== undefined && opts.journalMode !== 'DELETE') {
-      this.#db.exec(`PRAGMA journal_mode = ${this.#options.journalMode}`);
-    }
+    if (this.#options.open) {
+      if (this.#options.busyTimeout > 0) {
+        this.#db.exec(`PRAGMA busy_timeout = ${this.#options.busyTimeout}`);
+      }
+      if (opts.journalMode !== undefined && opts.journalMode !== 'DELETE') {
+        this.#db.exec(`PRAGMA journal_mode = ${this.#options.journalMode}`);
+      }
 
-    this.#log('connection', `open database ${path === ':memory:' ? '(in-memory)' : path}`, {
-      detail: `journalMode=${this.#options.journalMode}, fk=${this.#options.enableForeignKeyConstraints}`,
-    });
+      this.#log('connection', `open database ${path === ':memory:' ? '(in-memory)' : path}`, {
+        detail: `journalMode=${this.#options.journalMode}, fk=${this.#options.enableForeignKeyConstraints}`,
+      });
+    }
   }
 
   // ---- Raw access ----
@@ -260,7 +272,7 @@ export class Sqlo implements Executor {
     this.#ensureOpen();
     const started = performance.now();
     const stmt = this.#db.prepare(sql);
-    const rows = plainRows(stmt.all(...params as SQLInputValue[]) as T[]);
+    const rows = plainRows(stmt.all(...toBindables(params) as SQLInputValue[]) as T[]);
     this.#log('query', `all: ${sql}`, { sql, params, durationMs: performance.now() - started });
     return rows;
   }
@@ -275,7 +287,7 @@ export class Sqlo implements Executor {
     this.#ensureOpen();
     const started = performance.now();
     const stmt = this.#db.prepare(sql);
-    const row = plainRow(stmt.get(...params as SQLInputValue[]) as T | undefined);
+    const row = plainRow(stmt.get(...toBindables(params) as SQLInputValue[]) as T | undefined);
     this.#log('query', `get: ${sql}`, { sql, params, durationMs: performance.now() - started });
     return row;
   }
@@ -290,7 +302,7 @@ export class Sqlo implements Executor {
     this.#ensureOpen();
     const started = performance.now();
     const stmt = this.#db.prepare(sql);
-    const result = stmt.run(...params as SQLInputValue[]);
+    const result = stmt.run(...toBindables(params) as SQLInputValue[]);
     this.#log('query', `run: ${sql}`, { sql, params, durationMs: performance.now() - started });
     return result;
   }
@@ -309,19 +321,19 @@ export class Sqlo implements Executor {
     return {
       all(...params: unknown[]): Record<string, unknown>[] {
         const started = performance.now();
-        const rows = plainRows(stmt.all(...params as SQLInputValue[]) as Record<string, unknown>[]);
+        const rows = plainRows(stmt.all(...toBindables(params) as SQLInputValue[]) as Record<string, unknown>[]);
         self.#log('query', `all: ${sql}`, { sql, params, durationMs: performance.now() - started });
         return rows;
       },
       get(...params: unknown[]): Record<string, unknown> | undefined {
         const started = performance.now();
-        const row = plainRow(stmt.get(...params as SQLInputValue[]) as Record<string, unknown> | undefined);
+        const row = plainRow(stmt.get(...toBindables(params) as SQLInputValue[]) as Record<string, unknown> | undefined);
         self.#log('query', `get: ${sql}`, { sql, params, durationMs: performance.now() - started });
         return row;
       },
       run(...params: unknown[]): { changes: number | bigint; lastInsertRowid: number | bigint } {
         const started = performance.now();
-        const result = stmt.run(...params as SQLInputValue[]);
+        const result = stmt.run(...toBindables(params) as SQLInputValue[]);
         self.#log('query', `run: ${sql}`, { sql, params, durationMs: performance.now() - started });
         return result;
       },
@@ -441,6 +453,19 @@ export class Sqlo implements Executor {
 
     try {
       const result = fn();
+      // Guard the classic misuse: an async callback resolves AFTER this method
+      // has returned, so awaiting inside it would silently run outside the
+      // (already committed) transaction. Fail loudly instead.
+      if (
+        result !== null && typeof result === 'object' &&
+        typeof (result as { then?: unknown }).then === 'function'
+      ) {
+        throw new TypeError(
+          'Sqlo.transaction() received an async callback (returned a Promise). ' +
+          'The synchronous API cannot keep a transaction open across awaits — ' +
+          'use AsyncSqlo.transaction() instead.',
+        );
+      }
       this.#txDepth--;
       if (this.#txDepth === 0) {
         this.#db.exec('COMMIT');
@@ -452,12 +477,17 @@ export class Sqlo implements Executor {
       return result;
     } catch (err) {
       this.#txDepth--;
-      if (this.#txDepth === 0) {
-        this.#db.exec('ROLLBACK');
-        this.#log('transaction', 'ROLLBACK transaction', { level: 'warn' });
-      } else {
-        this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
-        this.#log('transaction', `ROLLBACK TO SAVEPOINT (depth ${this.#txDepth})`, { level: 'warn' });
+      try {
+        if (this.#txDepth === 0) {
+          this.#db.exec('ROLLBACK');
+          this.#log('transaction', 'ROLLBACK transaction', { level: 'warn' });
+        } else {
+          this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
+          this.#log('transaction', `ROLLBACK TO SAVEPOINT (depth ${this.#txDepth})`, { level: 'warn' });
+        }
+      } catch {
+        // The rollback itself failed (e.g. the failing statement already
+        // aborted the transaction). Never let that mask the original error.
       }
       throw err;
     }
@@ -605,13 +635,18 @@ export class Sqlo implements Executor {
       } catch (err) {
         this.#txDepth--;
         this.#log('migrate', `migration "${m.name}" failed`, { detail: `schema "${schema}"`, level: 'error' });
-        if (this.#txDepth === 0) {
-          this.#db.exec('ROLLBACK');
-        } else {
-          this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
+        try {
+          if (this.#txDepth === 0) {
+            this.#db.exec('ROLLBACK');
+          } else {
+            this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
+          }
+        } catch {
+          // Rollback already handled by the failing statement — keep going.
         }
+        const scope = this.#txDepth === 0 ? 'transaction rolled back' : 'rolled back to savepoint';
         throw new Error(
-          `Migration "${m.name}" failed. DB has been rolled back.`,
+          `Migration "${m.name}" failed (${scope}).`,
           { cause: err },
         );
       }
@@ -653,6 +688,30 @@ export class Sqlo implements Executor {
       this.#closed = true;
       this.#log('connection', 'close database');
     }
+  }
+
+  /**
+   * Open the database connection.
+   *
+   * Required after constructing with `{ open: false }`; also reopens a
+   * connection closed via `close()` (node:sqlite reopens at the path given to
+   * the constructor — file contents persist, `:memory:` contents do not).
+   * Idempotent: calling it on an already-open connection is a no-op.
+   */
+  open(): void {
+    if (!this.#db.isOpen) {
+      this.#db.open();
+      // Re-apply connection PRAGMAs — the constructor skips them when opened
+      // with `open: false` (node:sqlite rejects exec on a closed connection).
+      if (this.#options.busyTimeout > 0) {
+        this.#db.exec(`PRAGMA busy_timeout = ${this.#options.busyTimeout}`);
+      }
+      if (this.#options.journalMode !== 'DELETE') {
+        this.#db.exec(`PRAGMA journal_mode = ${this.#options.journalMode}`);
+      }
+      this.#log('connection', `open database ${this.#options.path === ':memory:' ? '(in-memory)' : this.#options.path}`);
+    }
+    this.#closed = false;
   }
 
   // ---- Internal ----

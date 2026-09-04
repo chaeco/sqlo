@@ -180,3 +180,27 @@ describe('table options', () => {
     assert.match(ddl, /\) STRICT WITHOUT ROWID$/);
   });
 });
+describe('DDL identifier safety', () => {
+  it('keeps valid collation names', () => {
+    const ddl = columnDDL({ type: 'TEXT', collate: 'NOCASE' });
+    assert.equal(ddl, 'TEXT COLLATE NOCASE');
+  });
+
+  it('rejects DDL injection through collate', () => {
+    assert.throws(
+      () => columnDDL({ type: 'TEXT', collate: 'NOCASE); DROP TABLE t;--' }),
+      /Invalid collation name/,
+    );
+  });
+
+  it('rejects invalid index directions', () => {
+    assert.throws(
+      () => indexDDLs({
+        name: 't_dir',
+        columns: { a: { type: 'TEXT' } },
+        indexes: [{ name: 'ix', columns: [{ name: 'a', direction: 'BOGUS' as unknown as 'ASC' }] }],
+      }),
+      /Invalid index direction/,
+    );
+  });
+});

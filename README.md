@@ -54,6 +54,7 @@ const users = db.define({
 
 // Connection options (all optional):
 //   path                            : database file path or ':memory:' (default)
+//   open                            : open the connection at construction (default true; pass false and call db.open() later)
 //   enableForeignKeyConstraints     : enforce FK constraints (default true)
 //   busyTimeout                     : busy timeout ms (default 5000)
 //   journalMode                     : 'DELETE'|'TRUNCATE'|'PERSIST'|'MEMORY'|'WAL'|'OFF'
@@ -149,6 +150,10 @@ types are inferred automatically:
 | `BLOB`      | `Uint8Array` |
 | `NUMERIC`   | `number`  |
 
+`BOOLEAN` columns are supported (stored as INTEGER per SQLite type affinity):
+`true` / `false` bind values are normalized to `1` / `0` at the binding
+boundary — inserts, updates and where clauses alike.
+
 Nullability rules:
 
 - A column **without** `notNull` is `T | null` in rows, optional in inserts,
@@ -204,12 +209,17 @@ users.all();                   // alias for findAll()
 users.count({ age: { gte: 18 } });
 users.exists({ name: 'bob' }); // boolean
 
-// Update — a WHERE condition is required.
-const changed = users.update({ age: 31 }, { id: u.id }); // → number affected
+// Update — a WHERE condition is required. Keys explicitly set to undefined in
+// the patch mean "not provided" and are never bound.
+const changed = users.update({ age: 31, email: undefined }, { id: u.id }); // → number affected (email untouched)
 
 // Delete — a WHERE condition is required.
 const deleted = users.delete({ id: u.id }); // → number affected
 ```
+
+`db.transaction()` runs the callback synchronously — an async callback throws
+a `TypeError` immediately, because the transaction cannot stay open across
+awaits (that is what `AsyncSqlo.transaction()` is for).
 
 ### Migration safety on update/delete
 
@@ -514,8 +524,10 @@ await db.migrate(migrations, { schema: 'main' });
 The callback receives an explicit `tx` handle: every operation through it
 runs inside the transaction and cannot be interleaved with other work. Use
 `tx.model(...)` for a type-safe copy of a model bound to the transaction —
-the `db`-bound model is serialized behind the running transaction and would
-dequeue only after it finishes. Nested transactions use
+the recommended way to run model operations in a transaction. While a
+transaction is open, `db`-level operations (including awaited calls on
+`db.define()`d models) join the open transaction — connection semantics,
+matching the sync `Sqlo`. Nested transactions use
 `tx.transaction(async (inner) => { ... })` (SAVEPOINTs).
 
 > **Honest disclaimer:** SQLite underneath is still synchronous and
@@ -568,8 +580,11 @@ try {
 
 `db.transaction(fn, { retry: n })` re‑runs the whole transaction from a fresh
 `BEGIN` with exponential backoff (50ms, 100ms, 200ms, …) when the database is
-locked. Non‑busy errors propagate immediately. Nested (SAVEPOINT)
-transactions are never retried — they belong to the outer transaction:
+**genuinely busy** (SQLITE_BUSY, "database is locked"). Non‑busy errors
+propagate immediately — including SQLITE_LOCKED ("table ... is locked", a
+table-level lock), which is no longer misclassified as busy and retried.
+Nested (SAVEPOINT) transactions are never retried — they belong to the outer
+transaction:
 
 ```ts
 db.transaction(() => {
@@ -582,7 +597,9 @@ db.transaction(() => {
 
 `insertMany(rows, { chunkSize })` inserts in chunks, each chunk in its own
 transaction (when not already inside an outer transaction) — keeping
-write‑lock hold time and memory bounded for very large batches:
+write‑lock hold time and memory bounded for very large batches. The default
+is a single transaction for all rows; `chunkSize` must be a positive integer
+and invalid values throw immediately:
 
 ```ts
 model.insertMany(bigRows, { chunkSize: 1000 });
@@ -620,6 +637,7 @@ backup), `migrate` (applied/pending/failed). The default `logLevel` is `warn`
 
 ```ts
 db.isOpen;                 // boolean — connection still open
+db.open();                 // open/reopen the connection (required after `open: false`; idempotent)
 db.version;                // SQLite library version, e.g. '3.46.0'
 db.databaseList();         // [{ name, file }, ...] — main + attached DBs
 db.tableExists('users');   // boolean — also 'schema.table' for attached DBs
@@ -717,8 +735,10 @@ be used:
 
 When each user (tenant) needs their **own** database file with fully isolated
 data, use `MultiSqlo`. It routes users to dedicated `Sqlo` instances, caches
-them, and runs your baseline migrations automatically the first time a user's
-database is created:
+them, and applies your baseline migrations automatically whenever a user's
+database has unapplied ones (idempotent: already-applied migrations are
+skipped via the version table, so a database file left behind by a previous
+crash mid-migration heals itself on the next access):
 
 ```ts
 import { MultiSqlo } from '@chaeco/sqlo';
@@ -732,7 +752,8 @@ const pool = new MultiSqlo({
   ],
 });
 
-// First access: creates the database file and applies baseline migrations.
+// First access: creates the database file and applies baseline migrations
+// (already-migrated databases are not re-migrated).
 const aliceDb = pool.for('alice');
 const posts = aliceDb.define({ name: 'posts', columns: { ... } });
 posts.insert({ userId: 1, title: 'alice post' });
@@ -762,6 +783,7 @@ separators. You can customize the file naming with a `fileName` option.
 | `AsyncSqlo` | Optional worker-thread wrapper that avoids event-loop blocking (full ORM surface mirrored as async classes). |
 | `AsyncModel<Row, Insert, Patch>` | Async CRUD mirror of `Model`, created via `AsyncSqlo#define()`. |
 | `AsyncQueryBuilder<Row>` | Fluent async SELECT builder, returned by `AsyncModel#query()` — chaining is sync, terminal calls are one RPC each. |
+| `SQLITE` | Named SQLite result codes (e.g. `SQLITE.BUSY`, `SQLITE.CONSTRAINT`) for error handling with `isBusyError` / `isConstraintError`. |
 
 ### Functions
 
@@ -783,7 +805,7 @@ separators. You can customize the file naming with a `fileName` option.
 
 `SqloOptions`, `MigrateOptions`, `MultiSqloOptions`, `SchemaDiff`, `TableDef`,
 `ColumnDef`, `IndexDef`, `RefAction`, `SqliteType`, `RowOf`, `InsertOf`,
-`PatchOf`, `WhereExpr`, `WhereValue`, `WhereOps`, `OrderDir`, `SqlFragment`, `Ident`, `MigrationDef`, `MigrationStatus`, `SqlOptions`, `AsyncExecutor`.
+`PatchOf`, `WhereExpr`, `WhereValue`, `WhereOps`, `OrderDir`, `SqlFragment`, `Ident`, `MigrationDef`, `MigrationStatus`, `SqlOptions`, `AsyncExecutor`, `AsyncTransaction`, `TypeToJs`, `ColumnValue`.
 
 ## Design principles
 

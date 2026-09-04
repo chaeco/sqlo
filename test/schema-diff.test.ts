@@ -199,3 +199,22 @@ describe('generateMigrationSql', () => {
     assert.match(sql, /No schema differences/);
   });
 });
+
+describe('schemaDiff edge cases', () => {
+  it('flags FK columns with non-NULL defaults as requiring a rebuild', () => {
+    const to: TableDef = {
+      ...from,
+      columns: {
+        ...from.columns,
+        orgId: {
+          type: 'INTEGER',
+          references: { table: 'orgs', column: 'id' },
+          default: 1,
+        },
+      },
+    };
+    const diff = schemaDiff(from, to);
+    assert.equal(diff.statements.length, 0, 'must not emit an ALTER TABLE SQLite rejects');
+    assert.match(diff.warnings.join('\n'), /FOREIGN KEY with a non-NULL DEFAULT/);
+  });
+});

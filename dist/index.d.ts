@@ -456,6 +456,11 @@ interface SqloOptions {
     enableForeignKeyConstraints?: boolean;
     enableDoubleQuotedStringLiterals?: boolean;
     allowExtension?: boolean;
+    /**
+     * Busy timeout in ms for `PRAGMA busy_timeout` — how long a statement waits
+     * for the write lock before failing with SQLITE_BUSY. Defaults to 5000ms
+     * (matching the README); pass `0` for SQLite's raw fail-fast behaviour.
+     */
     busyTimeout?: number;
     /**
      * Journal mode applied via `PRAGMA journal_mode` on open.
@@ -676,6 +681,15 @@ declare class Sqlo implements Executor {
      * Close the database connection.
      */
     close(): void;
+    /**
+     * Open the database connection.
+     *
+     * Required after constructing with `{ open: false }`; also reopens a
+     * connection closed via `close()` (node:sqlite reopens at the path given to
+     * the constructor — file contents persist, `:memory:` contents do not).
+     * Idempotent: calling it on an already-open connection is a no-op.
+     */
+    open(): void;
 }
 
 /**
@@ -700,9 +714,10 @@ interface MultiSqloOptions {
     /** Directory that holds one database file per user. */
     dir: string;
     /**
-     * Baseline migrations applied to a user's database the first time it is
-     * accessed (i.e. when the database file is created). Existing databases
-     * are never re-migrated — Sqlo tracks applied migrations by name.
+     * Baseline migrations applied to a user's database whenever it has
+     * unapplied migrations — including a database file a previous crash left
+     * behind before migration finished. Already-applied migrations are skipped
+     * via the version table, so this is a no-op for up-to-date databases.
      */
     migrations?: MigrationDef[];
     /**
@@ -1047,8 +1062,9 @@ interface AsyncExecutor {
  * The explicit transaction handle handed to a transaction callback.
  *
  * All operations performed through the handle are guaranteed to run inside
- * the transaction (the handle dispatches directly to the worker — it cannot
- * be interleaved with other operations). Pass an existing model to
+ * the transaction (the handle dispatches directly to the worker). Operations
+ * on `db`-bound executors issued while the transaction is open join the same
+ * transaction. Pass an existing model to
  * {@link AsyncTransaction#model} to get a copy bound to this transaction:
  *
  * ```ts
@@ -1274,9 +1290,11 @@ declare class AsyncSqlo implements AsyncExecutor {
     /**
      * @param path Database file path (or `':memory:'`) opened inside the worker.
      * @param options Options forwarded to the worker's `DatabaseSync`
-     *   constructor. Foreign-key enforcement defaults to `true` (matching the
-     *   synchronous `Sqlo`), so `define()` can warn when it is disabled while
-     *   the schema declares references.
+     *   constructor. `journalMode` and `busyTimeout` are applied as PRAGMAs
+     *   inside the worker (node:sqlite has no constructor options for them) —
+     *   same behaviour as the synchronous `Sqlo`. Foreign-key enforcement
+     *   defaults to `true` (matching the synchronous `Sqlo`), so `define()` can
+     *   warn when it is disabled while the schema declares references.
      */
     constructor(path: string, options?: Record<string, unknown>);
     /**
@@ -1324,8 +1342,11 @@ declare class AsyncSqlo implements AsyncExecutor {
     /**
      * Run a function inside a transaction — the async mirror of
      * `Sqlo#transaction`. The callback receives an explicit transaction handle
-     * (`tx`); every operation performed through it runs inside the transaction
-     * and cannot be interleaved with other operations.
+     * (`tx`); operations through it run inside the transaction. db-bound
+     * operations issued while the transaction is open (including awaited
+     * calls on `db.define()`d models) join the transaction too — the same
+     * connection semantics as the sync `Sqlo`. `tx.model(m)` remains the
+     * recommended, unambiguous way to run model operations in a transaction.
      *
      * ```ts
      * await db.transaction(async (tx) => {
@@ -1336,7 +1357,8 @@ declare class AsyncSqlo implements AsyncExecutor {
      * ```
      *
      * Nested transactions are available on the handle:
-     * `tx.transaction(async (inner) => { ... })` — they use SAVEPOINT / RELEASE
+     * `tx.transaction(async (inner) => { ... })` — and a nested
+     * `db.transaction(...)` call works as well — they use SAVEPOINT / RELEASE
      * in the worker and share the outer transaction's fate.
      *
      * Production concurrency: SQLite is single-writer, so concurrent writers can
@@ -1383,7 +1405,9 @@ declare class AsyncSqlo implements AsyncExecutor {
      */
     close(): Promise<void>;
     /**
-     * Terminate the worker immediately (without graceful shutdown).
+     * Terminate the worker immediately (without graceful shutdown). All pending
+     * and future operations reject — in-flight requests when the worker dies,
+     * and anything sent afterwards (fail-fast, never a hanging promise).
      */
     terminate(): void;
 }

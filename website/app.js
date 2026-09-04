@@ -23,6 +23,21 @@
 
   let stepIdx = 0;
   let rafId = 0;
+  const pendingTimers = new Set();
+
+  // setTimeout wrapper that tracks pending timers so a user-triggered replay
+  // can cancel them all (prevents two typing loops from running concurrently).
+  function later(fn, ms) {
+    const id = setTimeout(() => { pendingTimers.delete(id); fn(); }, ms);
+    pendingTimers.add(id);
+    return id;
+  }
+
+  function cancelPendingTimers() {
+    cancelAnimationFrame(rafId);
+    for (const id of pendingTimers) clearTimeout(id);
+    pendingTimers.clear();
+  }
 
   function highlightInline(code) {
     // 轻量内联高亮：字符串 / 数字 / 注释
@@ -85,7 +100,7 @@
       el.style.transition = `opacity 0.35s ${0.15 + idx * 0.14}s ease`;
       el.style.opacity = '1';
     });
-    setTimeout(done, 400 + rows.length * 140);
+    later(done, 400 + rows.length * 140);
   }
 
   // 初始隐藏输出行，准备动画
@@ -102,7 +117,7 @@
     stepIdx = (stepIdx + 1) % terminalSteps.length;
     playStep(terminalSteps[stepIdx], () => {
       caretEl.style.opacity = '1';
-      setTimeout(loop, 2600);
+      later(loop, 2600);
     });
   }
 
@@ -111,10 +126,10 @@
   if (terminal && terminalSteps.length) {
     terminal.addEventListener('click', () => {
       if (REDUCED) return;
-      cancelAnimationFrame(rafId);
+      cancelPendingTimers();
       prepOutput();
       playStep(terminalSteps[stepIdx], () => {
-        setTimeout(loop, 2600);
+        later(loop, 2600);
       });
     });
 

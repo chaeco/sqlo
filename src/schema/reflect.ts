@@ -140,14 +140,18 @@ function reflectRaw(exec: Executor, table: string): TableDef<Record<string, Colu
   }
 
   // ---- Table options from the CREATE TABLE SQL ----
+  // Keyword detection runs on a copy with string literals and quoted
+  // identifiers stripped, so text like CHECK (x <> 'STRICT') or a column
+  // named "STRICT" cannot produce a false positive.
   let strict = false;
   let withoutRowId = false;
   const sqlRow = exec.prepare(
     `SELECT sql FROM ${master} WHERE type = ? AND name = ?`,
   ).get('table', name) as { sql: string } | undefined;
   if (sqlRow?.sql) {
-    strict = /\bSTRICT\b/.test(sqlRow.sql);
-    withoutRowId = /\bWITHOUT\s+ROWID\b/i.test(sqlRow.sql);
+    const stripped = stripQuoted(sqlRow.sql);
+    strict = /\bSTRICT\b/.test(stripped);
+    withoutRowId = /\bWITHOUT\s+ROWID\b/i.test(stripped);
   }
 
   return {
@@ -169,7 +173,17 @@ function isAutoincrementTable(exec: Executor, schema: string, table: string): bo
   const row = exec.prepare(
     `SELECT sql FROM ${quoteIdent(schema)}.sqlite_master WHERE type = ? AND name = ?`,
   ).get('table', table) as { sql: string } | undefined;
-  return /\bAUTOINCREMENT\b/i.test(row?.sql ?? '');
+  // Strip string literals / quoted identifiers first: a DEFAULT 'AUTOINCREMENT'
+  // or a column named "AUTOINCREMENT" must not count as the keyword.
+  return /\bAUTOINCREMENT\b/i.test(row?.sql ? stripQuoted(row.sql) : '');
+}
+
+/**
+ * Replace single-quoted string literals and double-quoted identifiers with
+ * empty placeholders, so keyword scans only see real SQL keywords.
+ */
+function stripQuoted(sql: string): string {
+  return sql.replace(/'(?:[^']|'')*'/g, "''").replace(/"(?:[^"]|"")*"/g, '""');
 }
 
 /**
@@ -180,8 +194,8 @@ function isAutoincrementTable(exec: Executor, schema: string, table: string): bo
  */
 function parseDefaultLiteral(raw: string): unknown {
   const s = raw.trim();
-  // Number
-  if (/^[+-]?\d+(\.\d+)?$/.test(s)) {
+  // Number (incl. scientific notation and bare-fraction forms like .5)
+  if (/^[+-]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?$/.test(s)) {
     return Number(s);
   }
   // Quoted string '...' (SQLite doubles single quotes inside)

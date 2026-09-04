@@ -55,6 +55,12 @@ describe('quoteIdent / quoteTable', () => {
     assert.equal(quoteTable('main.users'), '"main"."users"');
   });
 
+  it('supports table aliases in quoteTable (AS and bare forms)', () => {
+    assert.equal(quoteTable('users AS u'), '"users" AS "u"');
+    assert.equal(quoteTable('users as u'), '"users" AS "u"');
+    assert.equal(quoteTable('users u'), '"users" AS "u"');
+  });
+
   it('rejects invalid identifiers', () => {
     for (const bad of ['', 'a b', '1abc', 'a;b', 'a-b']) {
       assert.throws(() => quoteIdent(bad), /Invalid SQL identifier/, `should reject ${JSON.stringify(bad)}`);

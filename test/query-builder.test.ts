@@ -5,7 +5,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createDb, userSchema } from './helpers.ts';
-import { raw, sql as sf } from '../src/index.ts';
+import { raw, sql as sf, Sqlo } from '../src/index.ts';
 
 const users = createDb().define(userSchema);
 users.sync();
@@ -245,5 +245,94 @@ describe('QueryBuilder basic', () => {
     const { sql, params } = qb.toSql();
     assert.equal(sql, 'SELECT * FROM "users" WHERE age >= 18');
     assert.deepEqual(params, []);
+  });
+});
+describe('QueryBuilder count & validation', () => {
+  it('count() honours distinct()', () => {
+    const db = createDb();
+    const t = db.define({
+      name: 'qb_distinct',
+      columns: {
+        id: { type: 'INTEGER', primaryKey: true, autoIncrement: true },
+        city: { type: 'TEXT' },
+      },
+    });
+    t.sync();
+    t.insert({ city: 'a' });
+    t.insert({ city: 'a' });
+    t.insert({ city: 'b' });
+    assert.equal(t.count(), 3);
+    assert.equal(t.query().distinct().select('city').count(), 2, 'COUNT(DISTINCT city)');
+    // Whole-row DISTINCT: every row has a unique autoincrement id, so the
+    // subquery wrapper must count 3 distinct rows (semantics, not a shortcut).
+    assert.equal(t.query().distinct().count(), 3, 'whole-row distinct via subquery');
+    db.close();
+  });
+
+  it('count() returns a plain number even with readBigInts', () => {
+    const db = new Sqlo({ path: ':memory:', readBigInts: true });
+    const t = db.define({
+      name: 'qb_bigint',
+      columns: { id: { type: 'INTEGER', primaryKey: true, autoIncrement: true } },
+    });
+    t.sync();
+    t.insertMany([{}, {}, {}]);
+    const n = t.count();
+    assert.equal(typeof n, 'number');
+    assert.equal(n, 3);
+    db.close();
+  });
+
+  it('orderBy rejects invalid directions instead of emitting them raw', () => {
+    assert.throws(
+      () => users.query().orderBy('id', 'DESC; DROP TABLE users--' as unknown as 'DESC'),
+      /Invalid orderBy direction/,
+    );
+    // Case-insensitive valid values still work.
+    assert.equal(users.query().orderBy('id', 'desc').toSql().sql, 'SELECT * FROM "users" ORDER BY "id" DESC');
+  });
+});
+
+describe('QueryBuilder raw and clone edges', () => {
+  it('raw() accepts a plain SQL string', () => {
+    const solo = users.query().raw('age > 18');
+    assert.match(solo.toSql().sql, /WHERE age > 18/);
+    assert.deepEqual(solo.toSql().params, []);
+    assert.ok(Array.isArray(solo.all()), 'executes without error');
+
+    const chained = users.query().where({ id: 1 }).raw('age > 18');
+    assert.match(chained.toSql().sql, /AND age > 18/);
+  });
+
+  it('raw() accepts a sql fragment with bound params', () => {
+    const solo = users.query().raw(sf`age > ${17}`);
+    assert.match(solo.toSql().sql, /WHERE age > \?/);
+    assert.deepEqual(solo.toSql().params, [17]);
+
+    const chained = users.query().where({ id: 1 }).raw(sf`age > ${17}`);
+    assert.match(chained.toSql().sql, /AND age > \?/);
+    assert.deepEqual(chained.toSql().params, [1, 17]);
+  });
+
+  it('array value shorthand compiles to IN and empty arrays to 0', () => {
+    const { sql, params } = users.query().where({ age: [18, 21, 25] }).toSql();
+    assert.match(sql, /"age" IN \(\?, \?, \?\)/);
+    assert.deepEqual(params, [18, 21, 25]);
+
+    const empty = users.query().where({ id: [] });
+    assert.match(empty.toSql().sql, /WHERE 0/);
+    assert.deepEqual(empty.all(), []);
+  });
+
+  it('in operator object form compiles like the array shorthand', () => {
+    const { sql, params } = users.query().where({ age: { in: [18, 21] } }).toSql();
+    assert.match(sql, /"age" IN \(\?, \?\)/);
+    assert.deepEqual(params, [18, 21]);
+  });
+
+  it('clone keeps HAVING when compiling first()/pluck()', () => {
+    const qb = users.query().groupBy('age').having(sf`COUNT(*) > 1`);
+    assert.match(qb.buildFirstSql().sql, /HAVING COUNT\(\*\) > 1/);
+    assert.match(qb.buildPluckSql('age').sql, /HAVING/);
   });
 });

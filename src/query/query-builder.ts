@@ -176,11 +176,15 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
    * direction (`'ASC'` default, or `'DESC'`).
    */
   orderBy(col: string | SqlFragment, dir: OrderDir = 'ASC'): this {
+    const d = dir.toUpperCase();
+    if (d !== 'ASC' && d !== 'DESC') {
+      throw new Error(`Invalid orderBy direction: "${dir}". Expected "ASC" or "DESC".`);
+    }
     if (isFragment(col)) {
-      this.#s.orderBys.push({ col: col.text, dir: dir.toUpperCase() });
+      this.#s.orderBys.push({ col: col.text, dir: d });
       return this;
     }
-    this.#s.orderBys.push({ col: quoteIdent(col), dir: dir.toUpperCase() });
+    this.#s.orderBys.push({ col: quoteIdent(col), dir: d });
     return this;
   }
 
@@ -289,6 +293,18 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
       const inner = this.toSql();
       countSql = `SELECT COUNT(*) AS "c" FROM (${inner.sql})`;
       params.push(...inner.params);
+    } else if (this.#s.distinct) {
+      // Honour DISTINCT: COUNT(DISTINCT col) for a single projected column,
+      // a DISTINCT subquery for multi-column / whole-row DISTINCT.
+      if (this.#s.selectCols && this.#s.selectCols.length === 1) {
+        countSql = `SELECT COUNT(DISTINCT ${this.#s.selectCols[0]}) AS "c" FROM ${quoteTable(this.#s.table)}`;
+        const whereClause = this.#buildWhereClauses(this.#s.whereGroups, params);
+        if (whereClause) countSql += ` ${whereClause}`;
+      } else {
+        const inner = this.toSql();
+        countSql = `SELECT COUNT(*) AS "c" FROM (${inner.sql})`;
+        params.push(...inner.params);
+      }
     } else {
       countSql = `SELECT COUNT(*) AS "c" FROM ${quoteTable(this.#s.table)}`;
       const whereClause = this.#buildWhereClauses(this.#s.whereGroups, params);
@@ -335,8 +351,10 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
   count(): number {
     const { sql, params } = this.buildCountSql();
     const stmt = this.#exec.prepare(sql);
-    const row = stmt.get(...params) as { c: number } | undefined;
-    return row?.c ?? 0;
+    const row = stmt.get(...params) as { c: number | bigint } | undefined;
+    // Coerce: with readBigInts the driver returns a bigint, but COUNT never
+    // exceeds the safe-integer range in realistic use — surface a number.
+    return row?.c === undefined ? 0 : Number(row.c);
   }
 
   /**
@@ -495,19 +513,25 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
       case 'glob':   return { text: `${col} GLOB ?`, params: [val] };
       case 'notGlob': return { text: `${col} NOT GLOB ?`, params: [val] };
       case 'in': {
-        const arr = val as readonly unknown[];
+        const arr = requireArray(op, val);
         if (arr.length === 0) return { text: '0', params: [] };
         const ph = arr.map(() => '?').join(', ');
         return { text: `${col} IN (${ph})`, params: extractValues(arr) };
       }
       case 'notIn': {
-        const arr = val as readonly unknown[];
+        const arr = requireArray(op, val);
         if (arr.length === 0) return { text: '1', params: [] };
         const ph = arr.map(() => '?').join(', ');
         return { text: `${col} NOT IN (${ph})`, params: extractValues(arr) };
       }
       case 'between': {
-        const pair = val as readonly [unknown, unknown];
+        const pair = requireArray(op, val);
+        if (pair.length !== 2) {
+          throw new Error(
+            `Where operator "between" requires a [min, max] tuple with exactly 2 elements, ` +
+            `got ${pair.length}.`,
+          );
+        }
         return { text: `${col} BETWEEN ? AND ?`, params: [pair[0], pair[1]] };
       }
       case 'is':    return { text: `${col} IS ?`, params: [val] };
@@ -528,4 +552,14 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
 
 function extractValues(arr: readonly unknown[]): unknown[] {
   return arr as unknown[];
+}
+
+/** Validate that an operator value is an array with a clear error message. */
+function requireArray(op: string, val: unknown): readonly unknown[] {
+  if (!Array.isArray(val)) {
+    throw new Error(
+      `Where operator "${op}" requires an array, got ${val === null ? 'null' : typeof val}.`,
+    );
+  }
+  return val;
 }

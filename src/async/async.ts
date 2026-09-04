@@ -96,13 +96,26 @@ export class AsyncSqlo implements AsyncExecutor {
   readonly #models = new Map<string, { sync(): Promise<void> }>();
   #nextId = 1;
   /**
-   * Tail of the FIFO dispatch lane. Every operation (exec/all/get/run,
-   * backup, close) and every transaction is enqueued onto this chain, so a
-   * transaction is an indivisible block — BEGIN → fn(tx) → COMMIT cannot be
-   * interleaved with any other operation. This restores the guarantee the
-   * sync `Sqlo` gets for free (the blocked event loop makes concurrent
-   * interleaving impossible) and prevents two concurrent `transaction()`
-   * calls from being merged into one physical transaction.
+   * Active transaction nesting depth on this connection. While > 0, ordinary
+   * db-level operations join the open transaction (connection semantics —
+   * the same mental model as the sync `Sqlo`), instead of being queued behind
+   * it on the FIFO lane, where an awaited call would deadlock the transaction.
+   */
+  #txDepth = 0;
+  /**
+   * Worker liveness. Once the worker has errored or exited, every future
+   * `#send` fails fast instead of posting a message that would never be
+   * answered (which would leave callers awaiting forever).
+   */
+  #dead = false;
+  #deadError: Error | undefined;
+  /**
+   * Tail of the FIFO dispatch lane. Outside transactions, every operation
+   * (exec/all/get/run, backup, close) and every transaction is enqueued onto
+   * this chain, so concurrent transactions cannot merge into one physical
+   * transaction. While a transaction is open, ordinary operations bypass the
+   * lane and join the open transaction instead (see {@link #dispatch}) —
+   * connection semantics, mirroring the sync `Sqlo`.
    */
   #tail: Promise<void> = Promise.resolve();
   readonly #fkEnabled: boolean;
@@ -110,9 +123,11 @@ export class AsyncSqlo implements AsyncExecutor {
   /**
    * @param path Database file path (or `':memory:'`) opened inside the worker.
    * @param options Options forwarded to the worker's `DatabaseSync`
-   *   constructor. Foreign-key enforcement defaults to `true` (matching the
-   *   synchronous `Sqlo`), so `define()` can warn when it is disabled while
-   *   the schema declares references.
+   *   constructor. `journalMode` and `busyTimeout` are applied as PRAGMAs
+   *   inside the worker (node:sqlite has no constructor options for them) —
+   *   same behaviour as the synchronous `Sqlo`. Foreign-key enforcement
+   *   defaults to `true` (matching the synchronous `Sqlo`), so `define()` can
+   *   warn when it is disabled while the schema declares references.
    */
   constructor(path: string, options?: Record<string, unknown>) {
     // Align the foreign-key default with the sync Sqlo (#60): enforcement is
@@ -120,7 +135,16 @@ export class AsyncSqlo implements AsyncExecutor {
     // remember it here for the define() warning.
     const fkEnabled = options?.enableForeignKeyConstraints !== false;
     this.#fkEnabled = fkEnabled;
-    const workerOptions = { ...options, enableForeignKeyConstraints: fkEnabled };
+    // busyTimeout defaults to 5000ms for parity with the sync Sqlo; an
+    // explicit value (including 0) wins. Resolve the default BEFORE the spread
+    // so an explicit `busyTimeout: undefined` can't punch through and leave
+    // the worker with SQLite's raw fail-fast default (0) while the sync Sqlo
+    // would apply 5000ms.
+    const workerOptions = {
+      ...options,
+      busyTimeout: options?.busyTimeout ?? 5000,
+      enableForeignKeyConstraints: fkEnabled,
+    };
 
     const workerPath = resolve(__dirname, 'async-worker.js');
     this.#worker = new Worker(workerPath, {
@@ -148,7 +172,9 @@ export class AsyncSqlo implements AsyncExecutor {
     });
 
     this.#worker.on('error', (err: Error) => {
-      // Reject all pending
+      // Mark dead first so queued operations also fail fast, then reject all
+      // in-flight requests.
+      this.#markDead(err);
       for (const [, p] of this.#pending) {
         p.reject(err);
       }
@@ -156,14 +182,25 @@ export class AsyncSqlo implements AsyncExecutor {
     });
 
     this.#worker.on('exit', (code: number) => {
+      this.#markDead(
+        code !== 0
+          ? new Error(`AsyncSqlo worker exited unexpectedly (code ${code}). Create a new AsyncSqlo instance.`)
+          : new Error('AsyncSqlo worker has exited. Create a new AsyncSqlo instance to continue.'),
+      );
       if (code !== 0) {
-        const err = new Error(`Worker exited with code ${code}`);
         for (const [, p] of this.#pending) {
-          p.reject(err);
+          p.reject(this.#deadError!);
         }
         this.#pending.clear();
       }
     });
+  }
+
+  #markDead(err: Error): void {
+    if (!this.#dead) {
+      this.#dead = true;
+      this.#deadError = err;
+    }
   }
 
   // ---- Dispatch lane ----
@@ -178,7 +215,31 @@ export class AsyncSqlo implements AsyncExecutor {
     return run;
   }
 
+  /**
+   * Dispatch an ordinary db-level operation. While a transaction is open on
+   * the connection, operations join it directly (mirroring the sync `Sqlo`,
+   * where any statement issued inside `transaction()` participates in the
+   * transaction). Outside a transaction they are serialized on the FIFO lane.
+   *
+   * Dispatching around the lane during a transaction is what makes an awaited
+   * db-bound model call inside `db.transaction(async (tx) => ...)` work
+   * instead of deadlocking: the lane is blocked by the transaction until the
+   * callback finishes, so a queued op could never run while the callback
+   * awaits it.
+   */
+  #dispatch<T>(op: WorkerRequest['op'], sql: string, params: unknown[] = []): Promise<T> {
+    if (this.#txDepth > 0) {
+      return this.#send<T>(op, sql, params);
+    }
+    return this.#enqueue(() => this.#send<T>(op, sql, params));
+  }
+
   #send<T>(op: WorkerRequest['op'], sql: string, params: unknown[] = []): Promise<T> {
+    if (this.#dead) {
+      return Promise.reject(
+        this.#deadError ?? new Error('AsyncSqlo worker is no longer running.'),
+      );
+    }
     return new Promise<T>((resolve, reject) => {
       const id = this.#nextId++;
       this.#pending.set(id, { resolve: resolve as (v: unknown) => void, reject });
@@ -190,7 +251,7 @@ export class AsyncSqlo implements AsyncExecutor {
    * Execute a SQL string (no return value).
    */
   exec(sql: string): Promise<void> {
-    return this.#enqueue(() => this.#send('exec', sql));
+    return this.#dispatch('exec', sql);
   }
 
   /**
@@ -200,7 +261,7 @@ export class AsyncSqlo implements AsyncExecutor {
     sql: string,
     ...params: unknown[]
   ): Promise<T[]> {
-    return this.#enqueue(() => this.#send<T[]>('all', sql, params));
+    return this.#dispatch<T[]>('all', sql, params);
   }
 
   /**
@@ -210,7 +271,7 @@ export class AsyncSqlo implements AsyncExecutor {
     sql: string,
     ...params: unknown[]
   ): Promise<T | undefined> {
-    return this.#enqueue(() => this.#send<T | undefined>('get', sql, params));
+    return this.#dispatch<T | undefined>('get', sql, params);
   }
 
   /**
@@ -223,7 +284,7 @@ export class AsyncSqlo implements AsyncExecutor {
     sql: string,
     ...params: unknown[]
   ): Promise<{ changes: number | bigint; lastInsertRowid: number | bigint }> {
-    return this.#enqueue(() => this.#send('run', sql, params));
+    return this.#dispatch('run', sql, params);
   }
 
   // ---- Schema & Model ----
@@ -286,8 +347,11 @@ export class AsyncSqlo implements AsyncExecutor {
   /**
    * Run a function inside a transaction — the async mirror of
    * `Sqlo#transaction`. The callback receives an explicit transaction handle
-   * (`tx`); every operation performed through it runs inside the transaction
-   * and cannot be interleaved with other operations.
+   * (`tx`); operations through it run inside the transaction. db-bound
+   * operations issued while the transaction is open (including awaited
+   * calls on `db.define()`d models) join the transaction too — the same
+   * connection semantics as the sync `Sqlo`. `tx.model(m)` remains the
+   * recommended, unambiguous way to run model operations in a transaction.
    *
    * ```ts
    * await db.transaction(async (tx) => {
@@ -298,7 +362,8 @@ export class AsyncSqlo implements AsyncExecutor {
    * ```
    *
    * Nested transactions are available on the handle:
-   * `tx.transaction(async (inner) => { ... })` — they use SAVEPOINT / RELEASE
+   * `tx.transaction(async (inner) => { ... })` — and a nested
+   * `db.transaction(...)` call works as well — they use SAVEPOINT / RELEASE
    * in the worker and share the outer transaction's fate.
    *
    * Production concurrency: SQLite is single-writer, so concurrent writers can
@@ -317,6 +382,13 @@ export class AsyncSqlo implements AsyncExecutor {
     const maxRetries = options?.retry ?? 0;
     for (;;) {
       try {
+        // Nested call (a db.transaction inside an active transaction, e.g. via
+        // migrate()): run it directly — the worker turns it into a SAVEPOINT.
+        // Enqueueing it would deadlock: the lane is blocked by the outer
+        // transaction, which is awaiting this very call.
+        if (this.#txDepth > 0) {
+          return await this.#transactionOnce(fn);
+        }
         // Enqueue the whole transaction as one indivisible block so it can
         // never be interleaved with concurrent operations or transactions.
         return await this.#enqueue(() => this.#transactionOnce(fn));
@@ -333,6 +405,7 @@ export class AsyncSqlo implements AsyncExecutor {
 
   async #transactionOnce<T>(fn: (tx: AsyncTransaction) => Promise<T>): Promise<T> {
     await this.#send('txBegin', '');
+    this.#txDepth++;
     const tx = this.#makeTransaction();
 
     try {
@@ -340,8 +413,14 @@ export class AsyncSqlo implements AsyncExecutor {
       await this.#send('txCommit', '');
       return result;
     } catch (err) {
-      await this.#send('txRollback', '');
+      try {
+        await this.#send('txRollback', '');
+      } catch {
+        // A failed rollback must not mask the original error.
+      }
       throw err;
+    } finally {
+      this.#txDepth--;
     }
   }
 
@@ -470,9 +549,12 @@ export class AsyncSqlo implements AsyncExecutor {
   }
 
   /**
-   * Terminate the worker immediately (without graceful shutdown).
+   * Terminate the worker immediately (without graceful shutdown). All pending
+   * and future operations reject — in-flight requests when the worker dies,
+   * and anything sent afterwards (fail-fast, never a hanging promise).
    */
   terminate(): void {
+    this.#markDead(new Error('AsyncSqlo worker was terminated. Create a new AsyncSqlo instance.'));
     this.#worker.terminate();
   }
 }

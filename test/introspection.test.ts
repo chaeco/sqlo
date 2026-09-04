@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, existsSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { Sqlo } from '../src/index.ts';
+import { Sqlo, reflectTableSchema } from '../src/index.ts';
 
 test('databaseList() reports main and attached databases with paths', () => {
   const dir = mkdtempSync(join(tmpdir(), 'sqlo-intro-'));
@@ -104,5 +104,31 @@ test('Model.deleteAll() clears all rows and returns the count', () => {
   const deleted = items.deleteAll();
   assert.equal(deleted, 3);
   assert.equal(items.count(), 0);
+  db.close();
+});
+
+test('reflectTableSchema ignores quoted text when detecting table options', () => {
+  const db = new Sqlo({ path: ':memory:' });
+  db.exec(
+    `CREATE TABLE tricky (
+      name TEXT CHECK (name <> 'STRICT'),
+      note TEXT DEFAULT 'AUTOINCREMENT WITHOUT ROWID'
+    )`,
+  );
+  const def = reflectTableSchema(db, 'tricky');
+  assert.ok(!def.strict, 'STRICT inside a string literal must not set strict');
+  assert.ok(!def.withoutRowId, 'WITHOUT ROWID inside a string literal must not set withoutRowId');
+  db.close();
+});
+
+test('reflectTableSchema keeps expression defaults as raw SQL text', () => {
+  const db = new Sqlo({ path: ':memory:' });
+  db.exec(`CREATE TABLE expr_defaults (
+    ts TEXT DEFAULT CURRENT_TIMESTAMP,
+    stamp TEXT DEFAULT (datetime('now'))
+  )`);
+  const def = reflectTableSchema(db, 'expr_defaults');
+  assert.equal(def.columns.ts!.default, 'CURRENT_TIMESTAMP');
+  assert.match(String(def.columns.stamp!.default), /datetime\('now'\)/);
   db.close();
 });

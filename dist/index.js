@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { readdirSync, readFileSync, mkdirSync, existsSync } from 'node:fs';
+import { readdirSync, readFileSync, mkdirSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { resolve, join, dirname } from 'node:path';
 import { createRequire } from 'node:module';
@@ -130,6 +130,14 @@ const SQL_IDENT = Symbol('sqlo.sqlIdent');
 // Helpers
 // ---------------------------------------------------------------------------
 const IDENT_RE = /^(?:[A-Za-z_][A-Za-z0-9_$]*)(?:\.[A-Za-z_][A-Za-z0-9_$]*)*$/;
+/**
+ * Runtime check — is `name` a safe single/qualified SQL identifier?
+ * Used by DDL generators to reject injection-prone inputs that are emitted
+ * unquoted (collation names, etc.).
+ */
+function isValidIdent(name) {
+    return IDENT_RE.test(name);
+}
 /**
  * Double-quote a SQL identifier (table name, column name), splitting on `.`.
  * Throws on invalid characters.
@@ -318,8 +326,16 @@ function columnDDL(col) {
         parts.push('NOT NULL');
     if (col.unique)
         parts.push('UNIQUE');
-    if (col.collate !== undefined)
+    if (col.collate !== undefined) {
+        // Collation names are emitted as bare identifiers — validate so a
+        // hostile value can't inject DDL. Built-ins: BINARY / NOCASE / RTRIM;
+        // custom collations (registered via extensions) must be plain identifiers.
+        if (!isValidIdent(col.collate)) {
+            throw new Error(`Invalid collation name: "${col.collate}". ` +
+                'Must be a plain SQL identifier (e.g. BINARY, NOCASE, RTRIM).');
+        }
         parts.push(`COLLATE ${col.collate}`);
+    }
     if (col.default !== undefined)
         parts.push(`DEFAULT ${escapeDefaultLiteral(col.default)}`);
     if (col.check) {
@@ -395,7 +411,13 @@ function indexDDLs(schema) {
         const colList = idx.columns.map((c) => {
             if (typeof c === 'string')
                 return quoteIdent(c);
-            return `${quoteIdent(c.name)}${c.direction ? ` ${c.direction}` : ''}`;
+            // Direction is emitted unquoted — whitelist it (runtime callers may
+            // pass arbitrary strings that TypeScript can't see).
+            const dir = c.direction?.toUpperCase();
+            if (dir !== undefined && dir !== 'ASC' && dir !== 'DESC') {
+                throw new Error(`Invalid index direction "${c.direction}" for index "${idx.name}". Expected "ASC" or "DESC".`);
+            }
+            return `${quoteIdent(c.name)}${dir ? ` ${dir}` : ''}`;
         }).join(', ');
         const unique = idx.unique ? 'UNIQUE ' : '';
         let sql = `CREATE ${unique}INDEX IF NOT EXISTS ${quoteIdent(idx.name)} ON ${quoteIdent(schema.name)} (${colList})`;
@@ -523,11 +545,15 @@ class QueryBuilder {
      * direction (`'ASC'` default, or `'DESC'`).
      */
     orderBy(col, dir = 'ASC') {
+        const d = dir.toUpperCase();
+        if (d !== 'ASC' && d !== 'DESC') {
+            throw new Error(`Invalid orderBy direction: "${dir}". Expected "ASC" or "DESC".`);
+        }
         if (isFragment(col)) {
-            this.#s.orderBys.push({ col: col.text, dir: dir.toUpperCase() });
+            this.#s.orderBys.push({ col: col.text, dir: d });
             return this;
         }
-        this.#s.orderBys.push({ col: quoteIdent(col), dir: dir.toUpperCase() });
+        this.#s.orderBys.push({ col: quoteIdent(col), dir: d });
         return this;
     }
     /** LIMIT the number of returned rows (bound as a parameter). */
@@ -629,6 +655,21 @@ class QueryBuilder {
             countSql = `SELECT COUNT(*) AS "c" FROM (${inner.sql})`;
             params.push(...inner.params);
         }
+        else if (this.#s.distinct) {
+            // Honour DISTINCT: COUNT(DISTINCT col) for a single projected column,
+            // a DISTINCT subquery for multi-column / whole-row DISTINCT.
+            if (this.#s.selectCols && this.#s.selectCols.length === 1) {
+                countSql = `SELECT COUNT(DISTINCT ${this.#s.selectCols[0]}) AS "c" FROM ${quoteTable(this.#s.table)}`;
+                const whereClause = this.#buildWhereClauses(this.#s.whereGroups, params);
+                if (whereClause)
+                    countSql += ` ${whereClause}`;
+            }
+            else {
+                const inner = this.toSql();
+                countSql = `SELECT COUNT(*) AS "c" FROM (${inner.sql})`;
+                params.push(...inner.params);
+            }
+        }
         else {
             countSql = `SELECT COUNT(*) AS "c" FROM ${quoteTable(this.#s.table)}`;
             const whereClause = this.#buildWhereClauses(this.#s.whereGroups, params);
@@ -671,7 +712,9 @@ class QueryBuilder {
         const { sql, params } = this.buildCountSql();
         const stmt = this.#exec.prepare(sql);
         const row = stmt.get(...params);
-        return row?.c ?? 0;
+        // Coerce: with readBigInts the driver returns a bigint, but COUNT never
+        // exceeds the safe-integer range in realistic use — surface a number.
+        return row?.c === undefined ? 0 : Number(row.c);
     }
     /**
      * Execute and return values of a single column.
@@ -813,21 +856,25 @@ class QueryBuilder {
             case 'glob': return { text: `${col} GLOB ?`, params: [val] };
             case 'notGlob': return { text: `${col} NOT GLOB ?`, params: [val] };
             case 'in': {
-                const arr = val;
+                const arr = requireArray(op, val);
                 if (arr.length === 0)
                     return { text: '0', params: [] };
                 const ph = arr.map(() => '?').join(', ');
                 return { text: `${col} IN (${ph})`, params: extractValues(arr) };
             }
             case 'notIn': {
-                const arr = val;
+                const arr = requireArray(op, val);
                 if (arr.length === 0)
                     return { text: '1', params: [] };
                 const ph = arr.map(() => '?').join(', ');
                 return { text: `${col} NOT IN (${ph})`, params: extractValues(arr) };
             }
             case 'between': {
-                const pair = val;
+                const pair = requireArray(op, val);
+                if (pair.length !== 2) {
+                    throw new Error(`Where operator "between" requires a [min, max] tuple with exactly 2 elements, ` +
+                        `got ${pair.length}.`);
+                }
                 return { text: `${col} BETWEEN ? AND ?`, params: [pair[0], pair[1]] };
             }
             case 'is': return { text: `${col} IS ?`, params: [val] };
@@ -847,6 +894,13 @@ _a = QueryBuilder;
 // ---------------------------------------------------------------------------
 function extractValues(arr) {
     return arr;
+}
+/** Validate that an operator value is an array with a clear error message. */
+function requireArray(op, val) {
+    if (!Array.isArray(val)) {
+        throw new Error(`Where operator "${op}" requires an array, got ${val === null ? 'null' : typeof val}.`);
+    }
+    return val;
 }
 
 /**
@@ -888,14 +942,17 @@ function pkColumns(schema) {
  * and whether the insert uses `DEFAULT VALUES` (no explicit columns).
  */
 function buildInsertSql(_schema, table, data) {
-    const cols = Object.keys(data);
+    // Explicit `undefined` means "not provided" — same as an absent key. Keeping
+    // it would make node:sqlite reject the binding with an opaque TypeError.
+    const entries = Object.entries(data).filter(([, v]) => v !== undefined);
+    const cols = entries.map(([k]) => k);
     if (cols.length === 0) {
         // INSERT with no columns: use DEFAULT VALUES
         return { sql: `INSERT INTO ${quoteIdent(table)} DEFAULT VALUES`, values: [], isEmpty: true };
     }
     const colIdents = cols.map((c) => quoteIdent(c)).join(', ');
     const placeholders = cols.map(() => '?').join(', ');
-    const values = Object.values(data);
+    const values = entries.map(([, v]) => v);
     return {
         sql: `INSERT INTO ${quoteIdent(table)} (${colIdents}) VALUES (${placeholders})`,
         values,
@@ -996,6 +1053,9 @@ class Model {
         if (rows.length === 0)
             return [];
         const chunkSize = options?.chunkSize ?? rows.length;
+        if (!Number.isInteger(chunkSize) || chunkSize < 1) {
+            throw new Error(`insertMany: chunkSize must be a positive integer, got ${options?.chunkSize}.`);
+        }
         const tx = this.#exec.transaction;
         const results = [];
         if (chunkSize >= rows.length) {
@@ -1062,11 +1122,14 @@ class Model {
      */
     update(patch, where) {
         validateKeys(this.#schema, this.table, patch);
-        const patchKeys = Object.keys(patch);
+        // Explicit `undefined` means "not patched" (matching the PatchOf type) —
+        // never bind it, node:sqlite would reject it with an opaque TypeError.
+        const patchEntries = Object.entries(patch).filter(([, v]) => v !== undefined);
+        const patchKeys = patchEntries.map(([k]) => k);
         if (patchKeys.length === 0)
             return 0;
         const setClause = patchKeys.map((k) => `${quoteIdent(k)} = ?`).join(', ');
-        const patchValues = Object.values(patch);
+        const patchValues = patchEntries.map(([, v]) => v);
         const qb = new QueryBuilder(this.#exec, this.table);
         qb.where(where);
         const { clause, params } = qb.buildWhere();
@@ -1311,9 +1374,10 @@ function isBusyError(e) {
     if (err.errcode !== undefined)
         return false;
     // Fallback: node:sqlite always sets errcode for SQLite failures, but be
-    // defensive about messages from other layers.
+    // defensive about messages from other layers. Only match the BUSY message —
+    // "table X is locked" is SQLITE_LOCKED (a different condition).
     const msg = err.message ?? '';
-    return /database is locked/i.test(msg) || /locked/i.test(msg);
+    return /database is locked/i.test(msg);
 }
 /**
  * Type guard — is this a constraint violation (`SQLITE_CONSTRAINT`, errcode
@@ -1356,6 +1420,24 @@ function shouldLog(level, threshold) {
 }
 
 /**
+ * Parameter binding normalization.
+ *
+ * node:sqlite rejects `boolean` values ("Provided value cannot be bound..."),
+ * but `BOOLEAN` is a documented column type in this ORM (stored as INTEGER
+ * per SQLite type affinity). Coerce at the binding boundary so `true`/`false`
+ * work everywhere — inserts, updates, where clauses — instead of surfacing an
+ * opaque driver error. All other values pass through untouched.
+ */
+function toBindable(value) {
+    if (typeof value === 'boolean')
+        return value ? 1 : 0;
+    return value;
+}
+function toBindables(params) {
+    return params.map(toBindable);
+}
+
+/**
  * Sqlo — the core class wrapping a `node:sqlite` DatabaseSync instance.
  */
 // ---------------------------------------------------------------------------
@@ -1394,7 +1476,11 @@ class Sqlo {
             enableForeignKeyConstraints: opts.enableForeignKeyConstraints ?? true,
             enableDoubleQuotedStringLiterals: opts.enableDoubleQuotedStringLiterals ?? false,
             allowExtension: opts.allowExtension ?? false,
-            busyTimeout: opts.busyTimeout ?? 0,
+            // 5000ms — the README-documented default and the production-sane choice:
+            // SQLite's own default is 0, which makes any concurrent writer fail
+            // with SQLITE_BUSY instantly. Callers who want the raw fail-fast
+            // behaviour can pass `busyTimeout: 0` explicitly.
+            busyTimeout: opts.busyTimeout ?? 5000,
             journalMode: opts.journalMode ?? 'DELETE',
             logLevel: opts.logLevel ?? 'warn',
             ...(opts.onLog !== undefined ? { onLog: opts.onLog } : {}),
@@ -1406,15 +1492,17 @@ class Sqlo {
             enableDoubleQuotedStringLiterals: this.#options.enableDoubleQuotedStringLiterals,
             allowExtension: this.#options.allowExtension,
         });
-        if (this.#options.busyTimeout > 0) {
-            this.#db.exec(`PRAGMA busy_timeout = ${this.#options.busyTimeout}`);
+        if (this.#options.open) {
+            if (this.#options.busyTimeout > 0) {
+                this.#db.exec(`PRAGMA busy_timeout = ${this.#options.busyTimeout}`);
+            }
+            if (opts.journalMode !== undefined && opts.journalMode !== 'DELETE') {
+                this.#db.exec(`PRAGMA journal_mode = ${this.#options.journalMode}`);
+            }
+            this.#log('connection', `open database ${path === ':memory:' ? '(in-memory)' : path}`, {
+                detail: `journalMode=${this.#options.journalMode}, fk=${this.#options.enableForeignKeyConstraints}`,
+            });
         }
-        if (opts.journalMode !== undefined && opts.journalMode !== 'DELETE') {
-            this.#db.exec(`PRAGMA journal_mode = ${this.#options.journalMode}`);
-        }
-        this.#log('connection', `open database ${path === ':memory:' ? '(in-memory)' : path}`, {
-            detail: `journalMode=${this.#options.journalMode}, fk=${this.#options.enableForeignKeyConstraints}`,
-        });
     }
     // ---- Raw access ----
     /**
@@ -1515,7 +1603,7 @@ class Sqlo {
         this.#ensureOpen();
         const started = performance.now();
         const stmt = this.#db.prepare(sql);
-        const rows = plainRows(stmt.all(...params));
+        const rows = plainRows(stmt.all(...toBindables(params)));
         this.#log('query', `all: ${sql}`, { sql, params, durationMs: performance.now() - started });
         return rows;
     }
@@ -1526,7 +1614,7 @@ class Sqlo {
         this.#ensureOpen();
         const started = performance.now();
         const stmt = this.#db.prepare(sql);
-        const row = plainRow(stmt.get(...params));
+        const row = plainRow(stmt.get(...toBindables(params)));
         this.#log('query', `get: ${sql}`, { sql, params, durationMs: performance.now() - started });
         return row;
     }
@@ -1537,7 +1625,7 @@ class Sqlo {
         this.#ensureOpen();
         const started = performance.now();
         const stmt = this.#db.prepare(sql);
-        const result = stmt.run(...params);
+        const result = stmt.run(...toBindables(params));
         this.#log('query', `run: ${sql}`, { sql, params, durationMs: performance.now() - started });
         return result;
     }
@@ -1551,19 +1639,19 @@ class Sqlo {
         return {
             all(...params) {
                 const started = performance.now();
-                const rows = plainRows(stmt.all(...params));
+                const rows = plainRows(stmt.all(...toBindables(params)));
                 self.#log('query', `all: ${sql}`, { sql, params, durationMs: performance.now() - started });
                 return rows;
             },
             get(...params) {
                 const started = performance.now();
-                const row = plainRow(stmt.get(...params));
+                const row = plainRow(stmt.get(...toBindables(params)));
                 self.#log('query', `get: ${sql}`, { sql, params, durationMs: performance.now() - started });
                 return row;
             },
             run(...params) {
                 const started = performance.now();
-                const result = stmt.run(...params);
+                const result = stmt.run(...toBindables(params));
                 self.#log('query', `run: ${sql}`, { sql, params, durationMs: performance.now() - started });
                 return result;
             },
@@ -1678,6 +1766,15 @@ class Sqlo {
         this.#txDepth++;
         try {
             const result = fn();
+            // Guard the classic misuse: an async callback resolves AFTER this method
+            // has returned, so awaiting inside it would silently run outside the
+            // (already committed) transaction. Fail loudly instead.
+            if (result !== null && typeof result === 'object' &&
+                typeof result.then === 'function') {
+                throw new TypeError('Sqlo.transaction() received an async callback (returned a Promise). ' +
+                    'The synchronous API cannot keep a transaction open across awaits — ' +
+                    'use AsyncSqlo.transaction() instead.');
+            }
             this.#txDepth--;
             if (this.#txDepth === 0) {
                 this.#db.exec('COMMIT');
@@ -1691,13 +1788,19 @@ class Sqlo {
         }
         catch (err) {
             this.#txDepth--;
-            if (this.#txDepth === 0) {
-                this.#db.exec('ROLLBACK');
-                this.#log('transaction', 'ROLLBACK transaction', { level: 'warn' });
+            try {
+                if (this.#txDepth === 0) {
+                    this.#db.exec('ROLLBACK');
+                    this.#log('transaction', 'ROLLBACK transaction', { level: 'warn' });
+                }
+                else {
+                    this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
+                    this.#log('transaction', `ROLLBACK TO SAVEPOINT (depth ${this.#txDepth})`, { level: 'warn' });
+                }
             }
-            else {
-                this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
-                this.#log('transaction', `ROLLBACK TO SAVEPOINT (depth ${this.#txDepth})`, { level: 'warn' });
+            catch {
+                // The rollback itself failed (e.g. the failing statement already
+                // aborted the transaction). Never let that mask the original error.
             }
             throw err;
         }
@@ -1829,13 +1932,19 @@ class Sqlo {
             catch (err) {
                 this.#txDepth--;
                 this.#log('migrate', `migration "${m.name}" failed`, { detail: `schema "${schema}"`, level: 'error' });
-                if (this.#txDepth === 0) {
-                    this.#db.exec('ROLLBACK');
+                try {
+                    if (this.#txDepth === 0) {
+                        this.#db.exec('ROLLBACK');
+                    }
+                    else {
+                        this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
+                    }
                 }
-                else {
-                    this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
+                catch {
+                    // Rollback already handled by the failing statement — keep going.
                 }
-                throw new Error(`Migration "${m.name}" failed. DB has been rolled back.`, { cause: err });
+                const scope = this.#txDepth === 0 ? 'transaction rolled back' : 'rolled back to savepoint';
+                throw new Error(`Migration "${m.name}" failed (${scope}).`, { cause: err });
             }
         }
         if (pending.length > 0) {
@@ -1870,6 +1979,29 @@ class Sqlo {
             this.#closed = true;
             this.#log('connection', 'close database');
         }
+    }
+    /**
+     * Open the database connection.
+     *
+     * Required after constructing with `{ open: false }`; also reopens a
+     * connection closed via `close()` (node:sqlite reopens at the path given to
+     * the constructor — file contents persist, `:memory:` contents do not).
+     * Idempotent: calling it on an already-open connection is a no-op.
+     */
+    open() {
+        if (!this.#db.isOpen) {
+            this.#db.open();
+            // Re-apply connection PRAGMAs — the constructor skips them when opened
+            // with `open: false` (node:sqlite rejects exec on a closed connection).
+            if (this.#options.busyTimeout > 0) {
+                this.#db.exec(`PRAGMA busy_timeout = ${this.#options.busyTimeout}`);
+            }
+            if (this.#options.journalMode !== 'DELETE') {
+                this.#db.exec(`PRAGMA journal_mode = ${this.#options.journalMode}`);
+            }
+            this.#log('connection', `open database ${this.#options.path === ':memory:' ? '(in-memory)' : this.#options.path}`);
+        }
+        this.#closed = false;
     }
     // ---- Internal ----
     #ensureOpen() {
@@ -1983,9 +2115,13 @@ class MultiSqlo {
             throw new Error(`fileName() for "${userId}" must be a plain file name, got "${fileName}".`);
         }
         const path = join(this.#dir, fileName);
-        const isNew = !existsSync(path);
         const db = new Sqlo({ path, ...(this.#options ?? {}) });
-        if (isNew && this.#migrations.length > 0) {
+        // Migrations are applied unconditionally and idempotently: the version
+        // table records what is already applied, so this is a no-op for migrated
+        // databases — and it heals a database file that a previous crash left
+        // behind before its baseline migrations finished (the old "file is new"
+        // check skipped migration in exactly that case).
+        if (this.#migrations.length > 0) {
             db.migrate(this.#migrations);
         }
         this.#instances.set(userId, db);
@@ -2074,6 +2210,10 @@ function hasIncompatibleAddColumn(name, col) {
     // SQLite's ALTER TABLE ADD COLUMN cannot add PRIMARY KEY / UNIQUE columns.
     if (col.primaryKey || col.unique) {
         return `Column "${name}" cannot be added with ALTER TABLE because it is PRIMARY KEY or UNIQUE. Requires a table-rebuild migration.`;
+    }
+    // SQLite requires a REFERENCES column added via ALTER TABLE to have a NULL default.
+    if (col.references && col.default !== undefined && col.default !== null) {
+        return `Column "${name}" has a FOREIGN KEY with a non-NULL DEFAULT — SQLite cannot add it with ALTER TABLE. Requires a table-rebuild migration.`;
     }
     if (col.notNull && col.default === undefined) {
         return `Column "${name}" is NOT NULL without a DEFAULT — SQLite cannot add it to a non-empty table. Add a DEFAULT or allow NULL.`;
@@ -2297,12 +2437,16 @@ function reflectRaw(exec, table) {
         }
     }
     // ---- Table options from the CREATE TABLE SQL ----
+    // Keyword detection runs on a copy with string literals and quoted
+    // identifiers stripped, so text like CHECK (x <> 'STRICT') or a column
+    // named "STRICT" cannot produce a false positive.
     let strict = false;
     let withoutRowId = false;
     const sqlRow = exec.prepare(`SELECT sql FROM ${master} WHERE type = ? AND name = ?`).get('table', name);
     if (sqlRow?.sql) {
-        strict = /\bSTRICT\b/.test(sqlRow.sql);
-        withoutRowId = /\bWITHOUT\s+ROWID\b/i.test(sqlRow.sql);
+        const stripped = stripQuoted(sqlRow.sql);
+        strict = /\bSTRICT\b/.test(stripped);
+        withoutRowId = /\bWITHOUT\s+ROWID\b/i.test(stripped);
     }
     return {
         name: table,
@@ -2320,7 +2464,16 @@ function reflectRaw(exec, table) {
  */
 function isAutoincrementTable(exec, schema, table) {
     const row = exec.prepare(`SELECT sql FROM ${quoteIdent(schema)}.sqlite_master WHERE type = ? AND name = ?`).get('table', table);
-    return /\bAUTOINCREMENT\b/i.test(row?.sql ?? '');
+    // Strip string literals / quoted identifiers first: a DEFAULT 'AUTOINCREMENT'
+    // or a column named "AUTOINCREMENT" must not count as the keyword.
+    return /\bAUTOINCREMENT\b/i.test(row?.sql ? stripQuoted(row.sql) : '');
+}
+/**
+ * Replace single-quoted string literals and double-quoted identifiers with
+ * empty placeholders, so keyword scans only see real SQL keywords.
+ */
+function stripQuoted(sql) {
+    return sql.replace(/'(?:[^']|'')*'/g, "''").replace(/"(?:[^"]|"")*"/g, '""');
 }
 /**
  * Best-effort conversion of a SQLite default-value literal into a JS value.
@@ -2330,8 +2483,8 @@ function isAutoincrementTable(exec, schema, table) {
  */
 function parseDefaultLiteral(raw) {
     const s = raw.trim();
-    // Number
-    if (/^[+-]?\d+(\.\d+)?$/.test(s)) {
+    // Number (incl. scientific notation and bare-fraction forms like .5)
+    if (/^[+-]?(\d+(\.\d+)?|\.\d+)([eE][+-]?\d+)?$/.test(s)) {
         return Number(s);
     }
     // Quoted string '...' (SQLite doubles single quotes inside)
@@ -2552,7 +2705,9 @@ class AsyncQueryBuilder {
     async count() {
         const { sql, params } = this.buildCountSql();
         const row = await this.#exec.get(sql, ...params);
-        return row?.c ?? 0;
+        // Coerce: with readBigInts the driver returns a bigint — COUNT fits a
+        // safe integer in realistic use, surface a plain number.
+        return row?.c === undefined ? 0 : Number(row.c);
     }
     /** Execute and return values of a single column. */
     async pluck(col) {
@@ -2626,6 +2781,9 @@ class AsyncModel {
         if (rows.length === 0)
             return [];
         const chunkSize = options?.chunkSize ?? rows.length;
+        if (!Number.isInteger(chunkSize) || chunkSize < 1) {
+            throw new Error(`insertMany: chunkSize must be a positive integer, got ${options?.chunkSize}.`);
+        }
         const tx = this.#exec.transaction;
         const results = [];
         // Inside a transaction, insert through a model bound to the handle — the
@@ -2695,11 +2853,14 @@ class AsyncModel {
      */
     async update(patch, where) {
         validateKeys(this.#schema, this.table, patch);
-        const patchKeys = Object.keys(patch);
+        // Explicit `undefined` means "not patched" (matching the PatchOf type) —
+        // never bind it, node:sqlite would reject it with an opaque TypeError.
+        const patchEntries = Object.entries(patch).filter(([, v]) => v !== undefined);
+        const patchKeys = patchEntries.map(([k]) => k);
         if (patchKeys.length === 0)
             return 0;
         const setClause = patchKeys.map((k) => `${quoteIdent(k)} = ?`).join(', ');
-        const patchValues = Object.values(patch);
+        const patchValues = patchEntries.map(([, v]) => v);
         const qb = new QueryBuilder(UNREACHABLE_EXECUTOR, this.table);
         qb.where(where);
         const { clause, params } = qb.buildWhere();
@@ -2808,22 +2969,37 @@ class AsyncSqlo {
     #models = new Map();
     #nextId = 1;
     /**
-     * Tail of the FIFO dispatch lane. Every operation (exec/all/get/run,
-     * backup, close) and every transaction is enqueued onto this chain, so a
-     * transaction is an indivisible block — BEGIN → fn(tx) → COMMIT cannot be
-     * interleaved with any other operation. This restores the guarantee the
-     * sync `Sqlo` gets for free (the blocked event loop makes concurrent
-     * interleaving impossible) and prevents two concurrent `transaction()`
-     * calls from being merged into one physical transaction.
+     * Active transaction nesting depth on this connection. While > 0, ordinary
+     * db-level operations join the open transaction (connection semantics —
+     * the same mental model as the sync `Sqlo`), instead of being queued behind
+     * it on the FIFO lane, where an awaited call would deadlock the transaction.
+     */
+    #txDepth = 0;
+    /**
+     * Worker liveness. Once the worker has errored or exited, every future
+     * `#send` fails fast instead of posting a message that would never be
+     * answered (which would leave callers awaiting forever).
+     */
+    #dead = false;
+    #deadError;
+    /**
+     * Tail of the FIFO dispatch lane. Outside transactions, every operation
+     * (exec/all/get/run, backup, close) and every transaction is enqueued onto
+     * this chain, so concurrent transactions cannot merge into one physical
+     * transaction. While a transaction is open, ordinary operations bypass the
+     * lane and join the open transaction instead (see {@link #dispatch}) —
+     * connection semantics, mirroring the sync `Sqlo`.
      */
     #tail = Promise.resolve();
     #fkEnabled;
     /**
      * @param path Database file path (or `':memory:'`) opened inside the worker.
      * @param options Options forwarded to the worker's `DatabaseSync`
-     *   constructor. Foreign-key enforcement defaults to `true` (matching the
-     *   synchronous `Sqlo`), so `define()` can warn when it is disabled while
-     *   the schema declares references.
+     *   constructor. `journalMode` and `busyTimeout` are applied as PRAGMAs
+     *   inside the worker (node:sqlite has no constructor options for them) —
+     *   same behaviour as the synchronous `Sqlo`. Foreign-key enforcement
+     *   defaults to `true` (matching the synchronous `Sqlo`), so `define()` can
+     *   warn when it is disabled while the schema declares references.
      */
     constructor(path, options) {
         // Align the foreign-key default with the sync Sqlo (#60): enforcement is
@@ -2831,7 +3007,16 @@ class AsyncSqlo {
         // remember it here for the define() warning.
         const fkEnabled = options?.enableForeignKeyConstraints !== false;
         this.#fkEnabled = fkEnabled;
-        const workerOptions = { ...options, enableForeignKeyConstraints: fkEnabled };
+        // busyTimeout defaults to 5000ms for parity with the sync Sqlo; an
+        // explicit value (including 0) wins. Resolve the default BEFORE the spread
+        // so an explicit `busyTimeout: undefined` can't punch through and leave
+        // the worker with SQLite's raw fail-fast default (0) while the sync Sqlo
+        // would apply 5000ms.
+        const workerOptions = {
+            ...options,
+            busyTimeout: options?.busyTimeout ?? 5000,
+            enableForeignKeyConstraints: fkEnabled,
+        };
         const workerPath = resolve(__dirname$1, 'async-worker.js');
         this.#worker = new Worker(workerPath, {
             workerData: { path, options: workerOptions },
@@ -2860,21 +3045,31 @@ class AsyncSqlo {
             }
         });
         this.#worker.on('error', (err) => {
-            // Reject all pending
+            // Mark dead first so queued operations also fail fast, then reject all
+            // in-flight requests.
+            this.#markDead(err);
             for (const [, p] of this.#pending) {
                 p.reject(err);
             }
             this.#pending.clear();
         });
         this.#worker.on('exit', (code) => {
+            this.#markDead(code !== 0
+                ? new Error(`AsyncSqlo worker exited unexpectedly (code ${code}). Create a new AsyncSqlo instance.`)
+                : new Error('AsyncSqlo worker has exited. Create a new AsyncSqlo instance to continue.'));
             if (code !== 0) {
-                const err = new Error(`Worker exited with code ${code}`);
                 for (const [, p] of this.#pending) {
-                    p.reject(err);
+                    p.reject(this.#deadError);
                 }
                 this.#pending.clear();
             }
         });
+    }
+    #markDead(err) {
+        if (!this.#dead) {
+            this.#dead = true;
+            this.#deadError = err;
+        }
     }
     // ---- Dispatch lane ----
     #enqueue(task) {
@@ -2883,7 +3078,28 @@ class AsyncSqlo {
         this.#tail = run.then(() => undefined, () => undefined);
         return run;
     }
+    /**
+     * Dispatch an ordinary db-level operation. While a transaction is open on
+     * the connection, operations join it directly (mirroring the sync `Sqlo`,
+     * where any statement issued inside `transaction()` participates in the
+     * transaction). Outside a transaction they are serialized on the FIFO lane.
+     *
+     * Dispatching around the lane during a transaction is what makes an awaited
+     * db-bound model call inside `db.transaction(async (tx) => ...)` work
+     * instead of deadlocking: the lane is blocked by the transaction until the
+     * callback finishes, so a queued op could never run while the callback
+     * awaits it.
+     */
+    #dispatch(op, sql, params = []) {
+        if (this.#txDepth > 0) {
+            return this.#send(op, sql, params);
+        }
+        return this.#enqueue(() => this.#send(op, sql, params));
+    }
     #send(op, sql, params = []) {
+        if (this.#dead) {
+            return Promise.reject(this.#deadError ?? new Error('AsyncSqlo worker is no longer running.'));
+        }
         return new Promise((resolve, reject) => {
             const id = this.#nextId++;
             this.#pending.set(id, { resolve: resolve, reject });
@@ -2894,19 +3110,19 @@ class AsyncSqlo {
      * Execute a SQL string (no return value).
      */
     exec(sql) {
-        return this.#enqueue(() => this.#send('exec', sql));
+        return this.#dispatch('exec', sql);
     }
     /**
      * Execute and return all rows.
      */
     all(sql, ...params) {
-        return this.#enqueue(() => this.#send('all', sql, params));
+        return this.#dispatch('all', sql, params);
     }
     /**
      * Execute and return the first row, or undefined.
      */
     get(sql, ...params) {
-        return this.#enqueue(() => this.#send('get', sql, params));
+        return this.#dispatch('get', sql, params);
     }
     /**
      * Execute and return { changes, lastInsertRowid }.
@@ -2915,7 +3131,7 @@ class AsyncSqlo {
      * large integers — coerce with `Number()` if you need a plain number.
      */
     run(sql, ...params) {
-        return this.#enqueue(() => this.#send('run', sql, params));
+        return this.#dispatch('run', sql, params);
     }
     // ---- Schema & Model ----
     /**
@@ -2966,8 +3182,11 @@ class AsyncSqlo {
     /**
      * Run a function inside a transaction — the async mirror of
      * `Sqlo#transaction`. The callback receives an explicit transaction handle
-     * (`tx`); every operation performed through it runs inside the transaction
-     * and cannot be interleaved with other operations.
+     * (`tx`); operations through it run inside the transaction. db-bound
+     * operations issued while the transaction is open (including awaited
+     * calls on `db.define()`d models) join the transaction too — the same
+     * connection semantics as the sync `Sqlo`. `tx.model(m)` remains the
+     * recommended, unambiguous way to run model operations in a transaction.
      *
      * ```ts
      * await db.transaction(async (tx) => {
@@ -2978,7 +3197,8 @@ class AsyncSqlo {
      * ```
      *
      * Nested transactions are available on the handle:
-     * `tx.transaction(async (inner) => { ... })` — they use SAVEPOINT / RELEASE
+     * `tx.transaction(async (inner) => { ... })` — and a nested
+     * `db.transaction(...)` call works as well — they use SAVEPOINT / RELEASE
      * in the worker and share the outer transaction's fate.
      *
      * Production concurrency: SQLite is single-writer, so concurrent writers can
@@ -2994,6 +3214,13 @@ class AsyncSqlo {
         const maxRetries = options?.retry ?? 0;
         for (;;) {
             try {
+                // Nested call (a db.transaction inside an active transaction, e.g. via
+                // migrate()): run it directly — the worker turns it into a SAVEPOINT.
+                // Enqueueing it would deadlock: the lane is blocked by the outer
+                // transaction, which is awaiting this very call.
+                if (this.#txDepth > 0) {
+                    return await this.#transactionOnce(fn);
+                }
                 // Enqueue the whole transaction as one indivisible block so it can
                 // never be interleaved with concurrent operations or transactions.
                 return await this.#enqueue(() => this.#transactionOnce(fn));
@@ -3011,6 +3238,7 @@ class AsyncSqlo {
     }
     async #transactionOnce(fn) {
         await this.#send('txBegin', '');
+        this.#txDepth++;
         const tx = this.#makeTransaction();
         try {
             const result = await fn(tx);
@@ -3018,8 +3246,16 @@ class AsyncSqlo {
             return result;
         }
         catch (err) {
-            await this.#send('txRollback', '');
+            try {
+                await this.#send('txRollback', '');
+            }
+            catch {
+                // A failed rollback must not mask the original error.
+            }
             throw err;
+        }
+        finally {
+            this.#txDepth--;
         }
     }
     /**
@@ -3121,9 +3357,12 @@ class AsyncSqlo {
         return this.#enqueue(() => this.#send('close', ''));
     }
     /**
-     * Terminate the worker immediately (without graceful shutdown).
+     * Terminate the worker immediately (without graceful shutdown). All pending
+     * and future operations reject — in-flight requests when the worker dies,
+     * and anything sent afterwards (fail-fast, never a hanging promise).
      */
     terminate() {
+        this.#markDead(new Error('AsyncSqlo worker was terminated. Create a new AsyncSqlo instance.'));
         this.#worker.terminate();
     }
 }

@@ -52,6 +52,7 @@ const users = db.define({
 
 // 连接选项（均可选）：
 //   path                            : 数据库文件路径或 ':memory:'（默认）
+//   open                            : 构造时是否立即打开连接（默认 true；传 false 则稍后调用 db.open()）
 //   enableForeignKeyConstraints     : 是否强制外键约束（默认 true）
 //   busyTimeout                     : 忙等待超时毫秒数（默认 5000）
 //   journalMode                     : 'DELETE'|'TRUNCATE'|'PERSIST'|'MEMORY'|'WAL'|'OFF'
@@ -141,6 +142,9 @@ users.sync();
 | `BLOB`      | `Uint8Array` |
 | `NUMERIC`   | `number`  |
 
+支持 `BOOLEAN` 列类型（按 SQLite 类型亲和存为 INTEGER）：绑定时 `true` / `false`
+会自动归一化为 `1` / `0`——insert、update、where 全路径生效。
+
 可空性规则：
 
 - **没有** `notNull` 的列，在行中是 `T | null`，插入时可选，且可以显式传 `null`。
@@ -191,12 +195,15 @@ users.all();                   // findAll() 的别名
 users.count({ age: { gte: 18 } });
 users.exists({ name: 'bob' }); // boolean
 
-// update —— 必须提供 WHERE 条件。
-const changed = users.update({ age: 31 }, { id: u.id }); // → 受影响行数
+// update —— 必须提供 WHERE 条件。patch 中显式为 undefined 的键视为「未提供」，不会被绑定。
+const changed = users.update({ age: 31, email: undefined }, { id: u.id }); // → 受影响行数（email 保持不变）
 
 // delete —— 必须提供 WHERE 条件。
 const deleted = users.delete({ id: u.id }); // → 受影响行数
 ```
+
+`db.transaction()` 同步执行回调——传入 async 回调会立即抛 `TypeError`，因为
+事务不会跨 await 保持打开（跨 await 的事务是 `AsyncSqlo.transaction()` 的职责）。
 
 ### update/delete 的迁移安全
 
@@ -483,9 +490,10 @@ await db.migrate(migrations, { schema: 'main' });
 ```
 
 回调收到显式的 `tx` 句柄：通过它执行的每个操作都在事务内部运行，不会被其他工
-作交错。用 `tx.model(...)` 获取绑定到该事务的模型类型安全副本——绑定在 `db`
-上的模型会被串行排在运行中的事务之后，只有等它结束才会出队。嵌套事务使用
-`tx.transaction(async (inner) => { ... })`（SAVEPOINT）。
+作交错。用 `tx.model(...)` 获取绑定到该事务的模型类型安全副本——这是事务内
+模型操作的推荐写法。事务打开期间，`db` 级操作（包括在 `db.define()` 模型上
+await 的调用）会直接加入当前事务（连接语义，与同步侧 `Sqlo` 一致）。嵌套事务
+使用 `tx.transaction(async (inner) => { ... })`（SAVEPOINT）。
 
 > **诚实声明：** 底层 SQLite 仍然是同步且单写者的。`AsyncSqlo` 只是避免事件
 > 循环阻塞——它**不会**让 SQLite 并发，多进程写入仍会表现为锁超时错误。
@@ -531,9 +539,11 @@ try {
 
 ### 锁竞争时自动重试
 
-`db.transaction(fn, { retry: n })` 在数据库被锁定时，从全新的 `BEGIN` 以
-指数退避（50ms、100ms、200ms……）重新执行整个事务。非 busy 错误立即抛出。
-嵌套（SAVEPOINT）事务**永不重试**——它们从属于外层事务：
+`db.transaction(fn, { retry: n })` 在数据库被**真正锁定**（SQLITE_BUSY，
+“database is locked”）时，从全新的 `BEGIN` 以指数退避（50ms、100ms、200ms……）
+重新执行整个事务。非 busy 错误立即抛出——包括 SQLITE_LOCKED（“table ... is
+locked”，表级锁竞争），它不会被误判为 busy 而重试。嵌套（SAVEPOINT）事务
+**永不重试**——它们从属于外层事务：
 
 ```ts
 db.transaction(() => {
@@ -545,7 +555,8 @@ db.transaction(() => {
 ### 大批量插入分块
 
 `insertMany(rows, { chunkSize })` 分块插入，每块独立事务（当不在外层事务
-中时）——让写锁持有时间和内存占用对超大批次保持有界：
+中时）——让写锁持有时间和内存占用对超大批次保持有界。默认单事务插入全部行；
+`chunkSize` 必须是正整数，非法值立即抛错：
 
 ```ts
 model.insertMany(bigRows, { chunkSize: 1000 });
@@ -581,6 +592,7 @@ backup）、`migrate`（applied/pending/failed）。默认 `logLevel` 为 `warn`
 
 ```ts
 db.isOpen;                 // boolean——连接是否仍然打开
+db.open();                 // 打开/重开连接（open: false 构造后必须调用；幂等）
 db.version;                // SQLite 库版本，如 '3.46.0'
 db.databaseList();         // [{ name, file }, ...]——main + 附加库
 db.tableExists('users');   // boolean——也支持 'schema.table'（附加库）
@@ -666,8 +678,9 @@ SQLite 的 `ATTACH` 有硬限制，决定了多库的使用形态：
 ## 多用户数据库（多租户）
 
 当每个用户（租户）需要**自己的**数据库文件、数据完全隔离时，使用
-`MultiSqlo`。它把用户路由到独立的 `Sqlo` 实例、缓存复用，并在用户库首次创建
-时自动应用基线迁移：
+`MultiSqlo`。它把用户路由到独立的 `Sqlo` 实例、缓存复用，并在用户库创建时
+自动应用基线迁移（幂等：已应用过的迁移按版本表跳过，因此也能自愈上次运行
+在迁移完成前崩溃留下的库文件）：
 
 ```ts
 import { MultiSqlo } from '@chaeco/sqlo';
@@ -681,7 +694,7 @@ const pool = new MultiSqlo({
   ],
 });
 
-// 首次访问：创建数据库文件并应用基线迁移。
+// 首次访问：创建数据库文件并应用基线迁移；已迁移的库不会重复应用。
 const aliceDb = pool.for('alice');
 const posts = aliceDb.define({ name: 'posts', columns: { ... } });
 posts.insert({ userId: 1, title: 'alice post' });
@@ -710,6 +723,7 @@ pool.closeAll();       // 关闭所有已打开的用户库
 | `AsyncSqlo` | 可选的 worker 线程封装，避免事件循环阻塞（完整 ORM 面镜像为异步类）。 |
 | `AsyncModel<Row, Insert, Patch>` | `Model` 的异步 CRUD 镜像，由 `AsyncSqlo#define()` 创建。 |
 | `AsyncQueryBuilder<Row>` | 流式异步 SELECT 构造器，由 `AsyncModel#query()` 返回——链式同步，终结调用各一次 RPC。 |
+| `SQLITE` | 命名的 SQLite 结果码（如 `SQLITE.BUSY`、`SQLITE.CONSTRAINT`），配合 `isBusyError` / `isConstraintError` 做错误处理。 |
 
 ### 函数
 
@@ -733,7 +747,7 @@ pool.closeAll();       // 关闭所有已打开的用户库
 `ColumnDef`、`IndexDef`、`RefAction`、`SqliteType`、`RowOf`、`InsertOf`、
 `PatchOf`、`WhereExpr`、`WhereValue`、`WhereOps`、`OrderDir`、`SqlFragment`、
 `Ident`、`MigrationDef`、`MigrationStatus`、`SqlOptions`、`AsyncExecutor`、
-`AsyncTransaction`。
+`AsyncTransaction`、`TypeToJs`、`ColumnValue`。
 
 ## 设计原则
 

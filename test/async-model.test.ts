@@ -593,11 +593,15 @@ describe('AsyncSqlo migrations', () => {
       { name: '0002_add', up: '' },
       { name: '0003_future', up: '' },
     ]);
-    assert.deepEqual(status, [
-      { name: '0001_init', appliedAt: status[0]!.appliedAt },
-      { name: '0002_add', appliedAt: status[1]!.appliedAt },
-      { name: '0003_future', appliedAt: null },
-    ]);
+    assert.deepEqual(
+      status.map((s) => ({ name: s.name, applied: s.appliedAt !== null })),
+      [
+        { name: '0001_init', applied: true },
+        { name: '0002_add', applied: true },
+        { name: '0003_future', applied: false },
+      ],
+    );
+    assert.ok(status[0]!.appliedAt, 'appliedAt is a non-empty timestamp');
 
     // Re-running is a no-op.
     const again = await db.migrate([{ name: '0001_init', up: '' }]);

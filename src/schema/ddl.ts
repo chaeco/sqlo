@@ -4,7 +4,7 @@
  */
 
 import type { ColumnDef, TableDef, SqlFragment } from './types';
-import { isFragment, quoteIdent } from '../query/sql';
+import { isFragment, quoteIdent, isValidIdent } from '../query/sql';
 
 // ---------------------------------------------------------------------------
 // Fragment coercion
@@ -68,7 +68,18 @@ export function columnDDL(col: ColumnDef<string>): string {
   if (col.autoIncrement) parts.push('AUTOINCREMENT');
   if (col.notNull) parts.push('NOT NULL');
   if (col.unique) parts.push('UNIQUE');
-  if (col.collate !== undefined) parts.push(`COLLATE ${col.collate}`);
+  if (col.collate !== undefined) {
+    // Collation names are emitted as bare identifiers — validate so a
+    // hostile value can't inject DDL. Built-ins: BINARY / NOCASE / RTRIM;
+    // custom collations (registered via extensions) must be plain identifiers.
+    if (!isValidIdent(col.collate)) {
+      throw new Error(
+        `Invalid collation name: "${col.collate}". ` +
+        'Must be a plain SQL identifier (e.g. BINARY, NOCASE, RTRIM).',
+      );
+    }
+    parts.push(`COLLATE ${col.collate}`);
+  }
   if (col.default !== undefined) parts.push(`DEFAULT ${escapeDefaultLiteral(col.default)}`);
   if (col.check) {
     const chk = toFragment(col.check);
@@ -153,7 +164,15 @@ export function indexDDLs(schema: TableDef): string[] {
   return schema.indexes.map((idx) => {
     const colList = idx.columns.map((c) => {
       if (typeof c === 'string') return quoteIdent(c);
-      return `${quoteIdent(c.name)}${c.direction ? ` ${c.direction}` : ''}`;
+      // Direction is emitted unquoted — whitelist it (runtime callers may
+      // pass arbitrary strings that TypeScript can't see).
+      const dir = c.direction?.toUpperCase();
+      if (dir !== undefined && dir !== 'ASC' && dir !== 'DESC') {
+        throw new Error(
+          `Invalid index direction "${c.direction}" for index "${idx.name}". Expected "ASC" or "DESC".`,
+        );
+      }
+      return `${quoteIdent(c.name)}${dir ? ` ${dir}` : ''}`;
     }).join(', ');
     const unique = idx.unique ? 'UNIQUE ' : '';
     let sql = `CREATE ${unique}INDEX IF NOT EXISTS ${quoteIdent(idx.name)} ON ${quoteIdent(schema.name)} (${colList})`;

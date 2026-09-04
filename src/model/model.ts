@@ -51,14 +51,19 @@ export function buildInsertSql(
   table: string,
   data: unknown,
 ): { sql: string; values: unknown[]; isEmpty: boolean } {
-  const cols = Object.keys(data as Record<string, unknown>);
+  // Explicit `undefined` means "not provided" — same as an absent key. Keeping
+  // it would make node:sqlite reject the binding with an opaque TypeError.
+  const entries = Object.entries(data as Record<string, unknown>).filter(
+    ([, v]) => v !== undefined,
+  );
+  const cols = entries.map(([k]) => k);
   if (cols.length === 0) {
     // INSERT with no columns: use DEFAULT VALUES
     return { sql: `INSERT INTO ${quoteIdent(table)} DEFAULT VALUES`, values: [], isEmpty: true };
   }
   const colIdents = cols.map((c) => quoteIdent(c)).join(', ');
   const placeholders = cols.map(() => '?').join(', ');
-  const values = Object.values(data as Record<string, unknown>);
+  const values = entries.map(([, v]) => v);
   return {
     sql: `INSERT INTO ${quoteIdent(table)} (${colIdents}) VALUES (${placeholders})`,
     values,
@@ -174,6 +179,11 @@ export class Model<Row extends Record<string, unknown>, Insert, Patch> {
   insertMany(rows: Insert[], options?: { chunkSize?: number }): Row[] {
     if (rows.length === 0) return [];
     const chunkSize = options?.chunkSize ?? rows.length;
+    if (!Number.isInteger(chunkSize) || chunkSize < 1) {
+      throw new Error(
+        `insertMany: chunkSize must be a positive integer, got ${options?.chunkSize}.`,
+      );
+    }
     const tx = this.#exec.transaction;
     const results: Row[] = [];
 
@@ -251,11 +261,16 @@ export class Model<Row extends Record<string, unknown>, Insert, Patch> {
    */
   update(patch: Patch, where: WhereExpr<Partial<Row>> | SqlFragment): number {
     validateKeys(this.#schema, this.table, patch);
-    const patchKeys = Object.keys(patch as Record<string, unknown>);
+    // Explicit `undefined` means "not patched" (matching the PatchOf type) —
+    // never bind it, node:sqlite would reject it with an opaque TypeError.
+    const patchEntries = Object.entries(patch as Record<string, unknown>).filter(
+      ([, v]) => v !== undefined,
+    );
+    const patchKeys = patchEntries.map(([k]) => k);
     if (patchKeys.length === 0) return 0;
 
     const setClause = patchKeys.map((k) => `${quoteIdent(k)} = ?`).join(', ');
-    const patchValues = Object.values(patch as Record<string, unknown>);
+    const patchValues = patchEntries.map(([, v]) => v);
 
     const qb = new QueryBuilder<Row>(this.#exec, this.table);
     qb.where(where as WhereExpr<Row>);

@@ -72,6 +72,21 @@ function handleError(id: number, err: unknown): void {
 const config: WorkerConfig = workerData as WorkerConfig;
 const db = new DatabaseSync(config.path, config.options ?? {});
 
+// Connection PRAGMAs — parity with the sync Sqlo constructor. node:sqlite's
+// DatabaseSyncOptions has no journalMode/busyTimeout, so AsyncSqlo forwards
+// them through workerData and they are applied here. Both are whitelisted /
+// validated rather than interpolated blindly.
+const JOURNAL_MODES = new Set(['DELETE', 'TRUNCATE', 'PERSIST', 'MEMORY', 'WAL', 'OFF']);
+
+const busyTimeout = config.options?.busyTimeout;
+if (typeof busyTimeout === 'number' && Number.isFinite(busyTimeout) && busyTimeout > 0) {
+  db.exec(`PRAGMA busy_timeout = ${Math.floor(busyTimeout)}`);
+}
+const journalMode = config.options?.journalMode;
+if (typeof journalMode === 'string' && JOURNAL_MODES.has(journalMode) && journalMode !== 'DELETE') {
+  db.exec(`PRAGMA journal_mode = ${journalMode}`);
+}
+
 // Transaction nesting depth, owned by the worker. 0 = no transaction open.
 // >0 = inside a transaction; the worker decides BEGIN vs SAVEPOINT based on
 // whether this is the top-level entry.
@@ -117,6 +132,10 @@ parentPort!.on('message', (msg: WorkerRequest) => {
         break;
       }
       case 'txCommit': {
+        if (txDepth === 0) {
+          handleError(msg.id, new Error('txCommit without an open transaction.'));
+          break;
+        }
         txDepth--;
         if (txDepth === 0) {
           db.exec('COMMIT');
@@ -127,6 +146,10 @@ parentPort!.on('message', (msg: WorkerRequest) => {
         break;
       }
       case 'txRollback': {
+        if (txDepth === 0) {
+          handleError(msg.id, new Error('txRollback without an open transaction.'));
+          break;
+        }
         txDepth--;
         if (txDepth === 0) {
           db.exec('ROLLBACK');

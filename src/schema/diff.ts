@@ -78,6 +78,10 @@ function hasIncompatibleAddColumn(name: string, col: ColumnDef<string>): string 
   if (col.primaryKey || col.unique) {
     return `Column "${name}" cannot be added with ALTER TABLE because it is PRIMARY KEY or UNIQUE. Requires a table-rebuild migration.`;
   }
+  // SQLite requires a REFERENCES column added via ALTER TABLE to have a NULL default.
+  if (col.references && col.default !== undefined && col.default !== null) {
+    return `Column "${name}" has a FOREIGN KEY with a non-NULL DEFAULT — SQLite cannot add it with ALTER TABLE. Requires a table-rebuild migration.`;
+  }
   if (col.notNull && col.default === undefined) {
     return `Column "${name}" is NOT NULL without a DEFAULT — SQLite cannot add it to a non-empty table. Add a DEFAULT or allow NULL.`;
   }

@@ -47,9 +47,10 @@ export function isBusyError(e: unknown): e is SqliteErrorLike {
   if (typeof err.errcode === 'number' && (err.errcode & 0xff) === SQLITE.BUSY) return true;
   if (err.errcode !== undefined) return false;
   // Fallback: node:sqlite always sets errcode for SQLite failures, but be
-  // defensive about messages from other layers.
+  // defensive about messages from other layers. Only match the BUSY message —
+  // "table X is locked" is SQLITE_LOCKED (a different condition).
   const msg = err.message ?? '';
-  return /database is locked/i.test(msg) || /locked/i.test(msg);
+  return /database is locked/i.test(msg);
 }
 
 /**

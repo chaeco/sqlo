@@ -182,3 +182,39 @@ describe('loadMigrations (async)', () => {
     );
   });
 });
+describe('loader and nesting edge cases', () => {
+  it('loads .cjs migrations via require (default and array exports)', () => {
+    writeFileSync(
+      join(tmpDir, '070_cjs.cjs'),
+      'module.exports = { name: "070_cjs", up: "CREATE TABLE c1 (id INTEGER)" };',
+    );
+    writeFileSync(
+      join(tmpDir, '071_cjs_arr.cjs'),
+      'module.exports = [ { name: "071_cjs_arr", up: "CREATE TABLE c2 (id INTEGER)" } ];',
+    );
+    const migrations = loadMigrationsSync(tmpDir);
+    assert.deepEqual(
+      migrations.filter((m) => m.name.startsWith('07')).map((m) => m.name),
+      ['070_cjs', '071_cjs_arr'],
+    );
+  });
+
+  it('migrate() participates in an outer transaction (SAVEPOINT)', () => {
+    const db = createDb();
+    assert.throws(
+      () => db.transaction(() => {
+        db.migrate([{ name: 'm_tx', up: 'CREATE TABLE mt (id INTEGER)' }]);
+        throw new Error('outer-rollback');
+      }),
+      /outer-rollback/,
+    );
+    assert.equal(db.tableExists('mt'), false, 'migration rolled back with the outer transaction');
+    assert.equal(db.migrate([{ name: 'm_tx', up: 'CREATE TABLE mt (id INTEGER)' }]).length, 1, 'version record was rolled back too, migration is pending again');
+
+    db.transaction(() => {
+      db.migrate([{ name: 'm_tx', up: 'CREATE TABLE mt (id INTEGER)' }]);
+    });
+    assert.ok(db.tableExists('mt'), 'migration committed with the outer transaction');
+    db.close();
+  });
+});

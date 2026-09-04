@@ -5,6 +5,47 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.0] - 2026-09-04
+
+### Added
+
+- **`Sqlo.open()` — 延迟打开与重开连接** — 构造时传 `{ open: false }` 推迟建立连接（此刻不执行任何 PRAGMA），调用 `open()` 激活；也用于 `close()` 后按构造路径重开（文件库数据持久，`:memory:` 不持久）。幂等：对已打开连接调用是无操作。重开时重新应用 `busyTimeout` / `journalMode` 两个连接级 PRAGMA，与构造时打开行为一致。
+
+### Fixed
+
+- **`busyTimeout` 实际默认值与文档一致（0 → 5000ms）** — README 一直写默认 5000，代码实际是 `?? 0`（SQLite 原生 fail-fast：并发写入立即抛 SQLITE_BUSY）。现在同步侧与 AsyncSqlo 的真实默认均为 5000ms；显式传 `0` 保留原生行为。AsyncSqlo 同时修复了显式传 `{ busyTimeout: undefined }` 穿透 spread 使兜底失效的缝隙（此前 worker 会静默落到 SQLite 原生 0，与同步侧不一致）。
+- **`open: false` 构造不再立即抛错** — 构造函数此前在 `open: false` 时仍无条件执行 `PRAGMA busy_timeout`，而 node:sqlite 对未打开连接的 `exec` 直接抛 `database is not open`，导致该选项事实上不可用。现在 PRAGMA 与连接日志只在真正打开时执行。
+- **`isBusyError` 不再误报 SQLITE_LOCKED** — 消息回退匹配从 `/locked/i` 收窄为仅 `database is locked`（SQLITE_BUSY 文本）；`table X is locked` 是 SQLITE_LOCKED（不同条件，重试无意义），此前会被误判为 busy 并触发无意义的重试。
+- **`insert` / `update` 跳过显式 `undefined` 值** — 显式 `undefined` 视为「未提供」（与 `InsertOf` / `PatchOf` 类型语义一致），不再是 node:sqlite 拒绝绑定的不透明 TypeError；全为 `undefined` 的 patch 是返回 0 的无操作。
+- **布尔值绑定** — `BOOLEAN` 是本 ORM 文档化列类型（按 SQLite 类型亲和存为 INTEGER），但 node:sqlite 拒绝绑定 boolean。现在在绑定边界统一将 `true` / `false` 归一化为 `1` / `0`——insert、update、where 子句全路径生效。
+- **`count()` / `count` 返回纯 number** — `readBigInts: true` 时驱动返回 bigint，现在统一 `Number()` 归一化（COUNT 在实际使用中不会超出安全整数范围），同步 QueryBuilder 与 AsyncModel 一致。
+- **MultiSqlo 崩溃自愈** — 迁移改为无条件幂等重放（版本表记录已应用项，对已迁移库是无操作），自愈上次运行在迁移完成前崩溃留下的库文件——旧的 `existsSync` 检查恰好在那种情况下永久跳过迁移。
+- **同步 `transaction()` 拒绝 async 回调** — 传入 async 函数此前静默失效：回调返回 Promise 后事务已提交，await 之后的语句运行在事务外。现在立即抛 `TypeError` 并提示改用 `AsyncSqlo.transaction()`。
+- **迁移失败时回滚自身不再掩盖原始错误** — 回滚语句本身失败（如失败语句已中止事务）时不再吞掉原始错误。
+
+### Changed
+
+- **DDL / 查询生成层校验收紧（运行时防线）** — TypeScript 只能约束编译期，运行时调用方可能传入任意字符串：
+  - `collate` 必须是合法 SQL 标识符（此前可注入 DDL）
+  - 索引 `direction` 与 `orderBy` 方向仅接受 ASC / DESC（大小写不敏感），非法值抛错
+  - `in` / `notIn` / `between` 操作符值必须是数组，`between` 必须是二元组，非法输入带明确错误消息抛出（此前静默产出错误 SQL 或绑定异常）
+- **`reflectTableSchema` 关键字检测剥离字符串与引号标识符** — 表名/默认值文本含 `STRICT`、`WITHOUT ROWID`、`AUTOINCREMENT` 字样不再产生误报；`parseDefaultLiteral` 补齐科学计数法与 `.5` 形式。
+- **`schemaDiff` 识别「带非 NULL 默认值的外键列」为需重建** — SQLite 不允许 ALTER TABLE 添加此类列。
+- **`insertMany` 校验 `chunkSize`** — 非正整数立即抛错（此前 `0` / 负数 / 非整数会死循环或产生错误分块）。
+- **AsyncSqlo 事务语义对齐同步侧** — 事务打开期间，db 级操作（包括 await 的 db 绑定模型调用）加入当前事务（连接语义），而非排队在 FIFO 通道后面导致死锁；`tx.model()` 仍是无歧义的推荐用法。worker 死亡后所有后续操作快速失败而非永久挂起。
+- **CI 不再重复构建** — `npm test` 已内含全量构建，移除独立的 Build 步骤。
+
+### Tests
+
+- **322 个测试**（0.5.0 为 269）：
+  - busyTimeout 四态（显式值 / `undefined` 穿透 / 省略 / 显式 0）、worker 内 journalMode PRAGMA
+  - `open: false` 延迟打开、`open()` 重开与幂等、PRAGMA 重放
+  - 布尔绑定全路径、`undefined` 插入/更新跳过、空 patch 无操作
+  - DDL 标识符安全（collate 注入拒绝、非法索引方向）、`in`/`between` 非法输入
+  - MultiSqlo 崩溃自愈与重复访问不重复迁移
+  - AsyncSqlo 事务内 db 绑定模型加入事务（无死锁）、嵌套事务 SAVEPOINT、worker 终止后错误传播
+  - `count()` bigint 归一化、`chunkSize` 校验、async 回调拒绝
+
 ## [0.5.0] - 2026-09-01
 
 ### Added

@@ -16,7 +16,7 @@
  * ```
  */
 
-import { existsSync, mkdirSync } from 'node:fs';
+import { mkdirSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { Sqlo, type SqloOptions } from './sqlo';
 import type { MigrationDef } from '../schema/types';
@@ -27,9 +27,10 @@ export interface MultiSqloOptions {
   /** Directory that holds one database file per user. */
   dir: string;
   /**
-   * Baseline migrations applied to a user's database the first time it is
-   * accessed (i.e. when the database file is created). Existing databases
-   * are never re-migrated — Sqlo tracks applied migrations by name.
+   * Baseline migrations applied to a user's database whenever it has
+   * unapplied migrations — including a database file a previous crash left
+   * behind before migration finished. Already-applied migrations are skipped
+   * via the version table, so this is a no-op for up-to-date databases.
    */
   migrations?: MigrationDef[];
   /**
@@ -95,10 +96,14 @@ export class MultiSqlo {
     }
 
     const path = join(this.#dir, fileName);
-    const isNew = !existsSync(path);
 
     const db = new Sqlo({ path, ...(this.#options ?? {}) });
-    if (isNew && this.#migrations.length > 0) {
+    // Migrations are applied unconditionally and idempotently: the version
+    // table records what is already applied, so this is a no-op for migrated
+    // databases — and it heals a database file that a previous crash left
+    // behind before its baseline migrations finished (the old "file is new"
+    // check skipped migration in exactly that case).
+    if (this.#migrations.length > 0) {
       db.migrate(this.#migrations);
     }
     this.#instances.set(userId, db);

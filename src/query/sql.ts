@@ -17,6 +17,15 @@ import { SQL_FRAGMENT, SQL_IDENT } from '../schema/types';
 const IDENT_RE = /^(?:[A-Za-z_][A-Za-z0-9_$]*)(?:\.[A-Za-z_][A-Za-z0-9_$]*)*$/;
 
 /**
+ * Runtime check — is `name` a safe single/qualified SQL identifier?
+ * Used by DDL generators to reject injection-prone inputs that are emitted
+ * unquoted (collation names, etc.).
+ */
+export function isValidIdent(name: string): boolean {
+  return IDENT_RE.test(name);
+}
+
+/**
  * Double-quote a SQL identifier (table name, column name), splitting on `.`.
  * Throws on invalid characters.
  */

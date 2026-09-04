@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { MultiSqlo, type MultiSqloOptions } from '../src/index.ts';
+import { MultiSqlo, Sqlo, type MultiSqloOptions } from '../src/index.ts';
 
 let dir: string;
 let pool: MultiSqlo;
@@ -141,5 +141,50 @@ describe('MultiSqlo security', () => {
     for (const ok of ['user-1', 'user_2', 'a.b', 'UPPER', 'x9']) {
       assert.doesNotThrow(() => pool.for(ok), `should accept ${ok}`);
     }
+  });
+});
+
+describe('MultiSqlo crash recovery', () => {
+  it('migrates a database file a crashed run left behind before migration', () => {
+    // Simulate a crash between "file created" and "baseline migrated":
+    // the file exists, but no version table / migrations were applied.
+    const crashed = new Sqlo({ path: join(dir, 'carol.db') });
+    crashed.close();
+
+    const db = pool.for('carol');
+    assert.ok(db.tableExists('users'), 'baseline migration applied despite pre-existing file');
+    assert.ok(db.tableExists('posts'));
+  });
+
+  it('does not duplicate migration records on repeated access', () => {
+    pool.for('dave');
+    const again = pool.for('dave'); // cached, but even a fresh open is idempotent
+    assert.deepEqual(again.migrationStatus(baseline).map((s) => s.appliedAt !== null), [true, true]);
+  });
+});
+
+describe('MultiSqlo input validation', () => {
+  it('rejects unsafe userIds', () => {
+    assert.throws(() => pool.for('../evil'), /Invalid userId/);
+    assert.throws(() => pool.for('.hidden'), /Invalid userId/);
+    assert.throws(() => pool.for('a/b'), /Invalid userId/);
+    assert.throws(() => pool.for(''), /Invalid userId/);
+    // Nothing was created for the rejected ids.
+    assert.equal(pool.size, 0);
+  });
+
+  it('rejects fileName strategies that escape the directory', () => {
+    assert.throws(
+      () => new MultiSqlo({ dir, fileName: () => '../escape.db' }).for('alice'),
+      /plain file name/,
+    );
+    assert.throws(
+      () => new MultiSqlo({ dir, fileName: () => 'sub/x.db' }).for('alice'),
+      /plain file name/,
+    );
+    assert.throws(
+      () => new MultiSqlo({ dir, fileName: () => '.' }).for('alice'),
+      /plain file name/,
+    );
   });
 });
