@@ -385,11 +385,14 @@ users.sync(); <span class="tok-comment">// 显式建表 —— 绝不自动</spa
       </div>
 
       <div class="demo__panel" id="tab-evolve" role="tabpanel" data-panel="evolve">
-        <pre class="demo__code"><code><span class="tok-var">import</span> { schemaDiff, generateMigrationSql } from <span class="tok-str">'@chaeco/sqlo'</span>;
+        <pre class="demo__code"><code><span class="tok-var">import</span> { schemaDiff, generateMigrationSql, reflectTableSchema, type TableDef } from <span class="tok-str">'@chaeco/sqlo'</span>;
 
 <span class="tok-comment">// 演进不靠自动 diff —— 而是差异分析 + 你审查后的 SQL 迁移</span>
 <span class="tok-var">const</span> actual   = reflectTableSchema(db, <span class="tok-str">'users'</span>);   <span class="tok-comment">// 数据库里真实的表</span>
-<span class="tok-var">const</span> desired  = { … };                          <span class="tok-comment">// 代码里想要的表</span>
+<span class="tok-var">const</span> desired: TableDef = {                        <span class="tok-comment">// 代码里想要的表</span>
+  name: <span class="tok-str">'users'</span>,
+  columns: { id: { type: <span class="tok-str">'INTEGER'</span>, primaryKey: <span class="tok-kw">true</span> }, age: { type: <span class="tok-str">'INTEGER'</span> } },
+};
 
 <span class="tok-var">const</span> diff = schemaDiff(actual, desired);
 <span class="tok-comment">// addedColumns → ['email']</span>
