@@ -4,8 +4,9 @@
 // specifiers in dist/test/*.js to point at the bundled entry.
 import { readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
-const TEST_DIR = new URL('../dist/test/', import.meta.url)
+const TEST_DIR = fileURLToPath(new URL('../dist/test/', import.meta.url))
 const rewrite = (text) =>
   text
     .replace(/from "\.\.\/src\/index\.js"/g, 'from "../index.js"')
@@ -14,7 +15,7 @@ const rewrite = (text) =>
 let changed = 0
 for (const entry of readdirSync(TEST_DIR)) {
   if (!entry.endsWith('.js')) continue
-  const file = join(TEST_DIR.pathname, entry)
+  const file = join(TEST_DIR, entry)
   const src = readFileSync(file, 'utf8')
   const next = rewrite(src)
   if (next !== src) {
