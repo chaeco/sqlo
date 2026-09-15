@@ -92,6 +92,21 @@ export interface TableDef<C extends Record<string, ColumnDef<string>> = Record<s
   withoutRowId?: boolean;
 }
 
+/**
+ * Shared base columns injected into every model defined on a connection
+ * (`SqloOptions.baseColumns` / `AsyncSqloOptions.baseColumns`). A per-schema
+ * column with the same name overrides the base column.
+ */
+export type BaseColumns = Record<string, ColumnDef<string>>;
+
+/**
+ * Merge `B` (base columns) into a table definition's columns, then give the
+ * schema's own columns priority on name collisions:
+ * `columns: { ...base, ...schema.columns }`.
+ */
+export type WithBaseColumns<S extends TableDef, B extends BaseColumns> =
+  TableDef<Omit<B, keyof S['columns']> & S['columns']> & Pick<S, 'name'>;
+
 // ---------------------------------------------------------------------------
 // Type inference: SQLite column type name → JavaScript type
 // ---------------------------------------------------------------------------

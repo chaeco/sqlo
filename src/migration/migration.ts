@@ -8,6 +8,7 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
 import type { MigrationDef } from '../schema/types';
 import { quoteIdent } from '../query/sql';
@@ -48,6 +49,15 @@ export function ensureMigrationTableSql(schema: string): string {
 /**
  * SELECT listing applied migration names and timestamps, ordered by name.
  */
+/**
+ * SELECT 1 when the version table exists in the given schema. Lets
+ * `migrationStatus()` report status without creating the table as a side
+ * effect of a read-only call.
+ */
+export function migrationTableExistsSql(schema: string): string {
+  return `SELECT 1 AS "ok" FROM ${quoteIdent(schema)}.sqlite_master WHERE type = 'table' AND name = '_sqlo_migrations'`;
+}
+
 export function getAppliedMigrationsSql(schema: string): string {
   return `SELECT "name", "applied_at" FROM ${migrationTableRef(schema)} ORDER BY "name"`;
 }
@@ -101,7 +111,22 @@ export function loadMigrationsSync(dir: string): MigrationDef[] {
           'Use loadMigrations() (async) instead.',
         );
       }
-      const mod = _require(fullPath) as Record<string, unknown>;
+      let mod: Record<string, unknown>;
+      try {
+        mod = _require(fullPath) as Record<string, unknown>;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        // Node < 22.12 throws ERR_REQUIRE_ESM for any ESM file. Modern Node
+        // require()s ESM without top-level await, and throws
+        // ERR_REQUIRE_ASYNC_MODULE when it has top-level await. Map both.
+        if (code === 'ERR_REQUIRE_ESM' || code === 'ERR_REQUIRE_ASYNC_MODULE') {
+          throw new Error(
+            `Cannot load ESM migration "${entry}" synchronously. Use loadMigrations() (async) instead.`,
+            { cause: err },
+          );
+        }
+        throw err;
+      }
       const result = mod.default ?? mod;
       if (Array.isArray(result)) {
         migrations.push(...result as MigrationDef[]);
@@ -137,9 +162,7 @@ export async function loadMigrations(dir: string): Promise<MigrationDef[]> {
       const sql = await readFile(fullPath, 'utf-8');
       migrations.push({ name, up: sql });
     } else if (ext === 'js' || ext === 'mjs' || ext === 'cjs') {
-      const absUrl = ext === 'cjs'
-        ? fullPath
-        : `file://${fullPath}`;
+      const absUrl = pathToFileURL(fullPath).href;
       const mod = await import(absUrl) as Record<string, unknown>;
       const result = mod.default ?? mod;
       if (Array.isArray(result)) {

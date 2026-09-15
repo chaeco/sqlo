@@ -341,13 +341,20 @@ users.query()
       <div class="demo__panel is-active" id="tab-schema" role="tabpanel" data-panel="schema">
         <pre class="demo__code"><code><span class="tok-var">import</span> { Sqlo, sql } from <span class="tok-str">'@chaeco/sqlo'</span>;
 
-<span class="tok-var">const</span> db = <span class="tok-var">new</span> Sqlo({ path: <span class="tok-str">':memory:'</span> });
+<span class="tok-comment">// 公共账本列声明一次 —— 自动合并进每个 define()</span>
+<span class="tok-var">const</span> db = <span class="tok-var">new</span> Sqlo({
+  path: <span class="tok-str">':memory:'</span>,
+  baseColumns: {
+    id:         { type: <span class="tok-str">'INTEGER'</span>, primaryKey: <span class="tok-kw">true</span>, autoIncrement: <span class="tok-kw">true</span> },
+    created_at: { type: <span class="tok-str">'TEXT'</span>, notNull: <span class="tok-kw">true</span>,
+                  default: sql<span class="tok-tpl">`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))`</span> },
+  },
+});
 
 <span class="tok-comment">// 一个普通对象 —— 类型从这里推导</span>
 <span class="tok-var">const</span> users = db.define({
   name: <span class="tok-str">'users'</span>,
   columns: {
-    id:    { type: <span class="tok-str">'INTEGER'</span>, primaryKey: <span class="tok-kw">true</span>, autoIncrement: <span class="tok-kw">true</span> },
     name:  { type: <span class="tok-str">'TEXT'</span>, notNull: <span class="tok-kw">true</span> },
     email: { type: <span class="tok-str">'TEXT'</span>, notNull: <span class="tok-kw">true</span> },
     age:   { type: <span class="tok-str">'INTEGER'</span> },
@@ -357,7 +364,7 @@ users.query()
 
 users.sync(); <span class="tok-comment">// 显式建表 —— 绝不自动</span>
 <span class="tok-var">const</span> alice = users.insert({ name: <span class="tok-str">'alice'</span>, email: <span class="tok-str">'a@x.io'</span>, age: <span class="tok-num">30</span> });
-<span class="tok-comment">// ^? { id: number; name: string; email: string; age: number | null }</span></code></pre>
+<span class="tok-comment">// ^? { id: number; created_at: string; name: string; email: string; age: number | null }</span></code></pre>
       </div>
 
       <div class="demo__panel" id="tab-query" role="tabpanel" data-panel="query">

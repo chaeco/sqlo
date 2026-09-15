@@ -18,7 +18,7 @@ interface QBState {
   whereGroups: WhereCondition[];
   groupBys: string[];
   havings: WhereCondition[];
-  orderBys: { col: string; dir: string }[];
+  orderBys: { col: string; dir: string; params: unknown[] }[];
   limitV: number | null;
   offsetV: number | null;
 }
@@ -181,10 +181,13 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
       throw new Error(`Invalid orderBy direction: "${dir}". Expected "ASC" or "DESC".`);
     }
     if (isFragment(col)) {
-      this.#s.orderBys.push({ col: col.text, dir: d });
+      // Keep the fragment's bound params — ORDER BY can legitimately contain
+      // placeholders (e.g. CASE WHEN ? ...). Dropping them would silently bind
+      // them to NULL in node:sqlite instead of failing.
+      this.#s.orderBys.push({ col: col.text, dir: d, params: [...col.params] });
       return this;
     }
-    this.#s.orderBys.push({ col: quoteIdent(col), dir: d });
+    this.#s.orderBys.push({ col: quoteIdent(col), dir: d, params: [] });
     return this;
   }
 
@@ -260,6 +263,7 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
     // ORDER BY
     if (this.#s.orderBys.length > 0) {
       parts.push(`ORDER BY ${this.#s.orderBys.map((o) => `${o.col} ${o.dir}`).join(', ')}`);
+      for (const o of this.#s.orderBys) params.push(...o.params);
     }
 
     // LIMIT / OFFSET
@@ -391,7 +395,7 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
         type: g.type,
         fragments: [...g.fragments],
       })),
-      orderBys: [...this.#s.orderBys],
+      orderBys: this.#s.orderBys.map((o) => ({ ...o, params: [...o.params] })),
       limitV: this.#s.limitV,
       offsetV: this.#s.offsetV,
     };
@@ -403,43 +407,40 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
     params: unknown[],
     keyword: 'WHERE' | 'HAVING' = 'WHERE',
   ): string {
-    if (groups.length === 0) return '';
+    // Drop empty groups (e.g. `where({})`) BEFORE pairing conditions with
+    // operators. Previously an empty group was skipped while building the SQL
+    // but still consumed an index in the operator loop, so a later OR could be
+    // silently turned into an AND.
+    const nonEmpty = groups.filter((g) => g.fragments.length > 0);
+    if (nonEmpty.length === 0) return '';
 
-    const groupSqls: string[] = [];
-
-    for (const group of groups) {
-      const frags = group.fragments;
-      if (frags.length === 0) continue;
-      const combined = frags
+    const groupSqls: string[] = nonEmpty.map((group) =>
+      group.fragments
         .map((f) => {
           params.push(...f.params);
           return f.text;
         })
-        .join(' AND ');
-      groupSqls.push(combined);
-    }
-
-    if (groupSqls.length === 0) return '';
+        .join(' AND '),
+    );
 
     // Build group joining: consecutive groups with the same operator join naturally;
     // when the operator changes, parenthesize the accumulated result only if it is
     // already compound (multiple conditions), to avoid noisy single-condition parens.
     let result = groupSqls[0]!;
-    let lastOp = groups[0]!.type;
+    let lastOp = nonEmpty[0]!.type;
     let compound = result.includes(' AND ') || result.includes(' OR ');
 
-    for (let i = 1; i < groupSqls.length; i++) {
-      const op = groups[i]!.type;
+    for (let i = 1; i < nonEmpty.length; i++) {
+      const op = nonEmpty[i]!.type;
       const cur = groupSqls[i]!;
       if (op === lastOp) {
         result += ` ${op} ${cur}`;
-        compound = true;
       } else {
         if (compound) result = `(${result})`;
         result += ` ${op} ${cur}`;
-        compound = true;
         lastOp = op;
       }
+      compound = true;
     }
 
     return `${keyword} ${result}`;
@@ -475,8 +476,26 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
       return { text: `${col} IN (${placeholders})`, params: extractValues(val) } as unknown as SqlFragment;
     }
 
+    // Binary column values (BLOB) are scalars, not operator objects. Without
+    // this they would be read as an operator map with numeric keys and throw
+    // "Unknown where operator: 0".
+    if (val instanceof Uint8Array) {
+      return { text: `${col} = ?`, params: [val] } as unknown as SqlFragment;
+    }
+
     // WhereOps object
     if (typeof val === 'object' && val !== null) {
+      // Only a plain object can describe operators. Anything else (Date, Map,
+      // Set, class instance, ...) is a mistake; silently treating it as an
+      // empty operator set used to produce `1` (match EVERY row) and turn a
+      // scoped update/delete into a full-table one.
+      if (!isPlainObject(val)) {
+        throw new Error(
+          `Invalid WHERE value for column "${col}": expected a scalar, an array, a binary value, ` +
+          `or an operator object, got ${describeValue(val)}. ` +
+          'Wrap raw SQL expressions in a sql fragment instead.',
+        );
+      }
       const ops = val as WhereOps<unknown>;
       const fragments: { text: string; params: unknown[] }[] = [];
 
@@ -487,7 +506,14 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
       }
 
       if (fragments.length === 0) {
-        return { text: '1', params: [] } as unknown as SqlFragment;
+        // An operator object with no effective operator must never degrade to
+        // a match-all condition: `{ eq: undefined }` would otherwise filter
+        // nothing and affect every row.
+        throw new Error(
+          `Empty WHERE condition for column "${col}": an operator object must set at least ` +
+          'one operator (eq, ne, gt, gte, lt, lte, like, notLike, glob, notGlob, in, notIn, ' +
+          'between, is, isNot, isNull, notNull).',
+        );
       }
 
       // Multiple ops on same column: AND-join them
@@ -552,6 +578,22 @@ export class QueryBuilder<Row extends Record<string, unknown> = Record<string, u
 
 function extractValues(arr: readonly unknown[]): unknown[] {
   return arr as unknown[];
+}
+
+/** Is `v` a plain object (object literal or `Object.create(null)`)? */
+function isPlainObject(v: unknown): boolean {
+  if (typeof v !== 'object' || v === null) return false;
+  const proto = Object.getPrototypeOf(v);
+  return proto === Object.prototype || proto === null;
+}
+
+/** Human-readable description of an unexpected WHERE value. */
+function describeValue(v: unknown): string {
+  if (v instanceof Date) return 'a Date';
+  if (v instanceof Map) return 'a Map';
+  if (v instanceof Set) return 'a Set';
+  const name = (v as { constructor?: { name?: string } })?.constructor?.name;
+  return name && name !== 'Object' ? `an instance of ${name}` : typeof v;
 }
 
 /** Validate that an operator value is an array with a clear error message. */

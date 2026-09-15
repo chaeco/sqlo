@@ -2,9 +2,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { readdirSync, readFileSync, mkdirSync } from 'node:fs';
 import { readdir, readFile } from 'node:fs/promises';
 import { resolve, join, dirname } from 'node:path';
+import { pathToFileURL, fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 import { Worker } from 'node:worker_threads';
-import { fileURLToPath } from 'node:url';
+import { AsyncLocalStorage } from 'node:async_hooks';
 
 /**
  * Schema validation.
@@ -29,6 +30,19 @@ const VALID_COLUMN_TYPES = new Set([
 const VALID_REF_ACTIONS = new Set([
     'CASCADE', 'SET NULL', 'SET DEFAULT', 'RESTRICT', 'NO ACTION',
 ]);
+/**
+ * SQLite accepts arbitrary type names (type affinity), including multi-word
+ * names like `UNSIGNED BIG INT`, `DOUBLE PRECISION` and sized forms like
+ * `VARCHAR(255)` / `DECIMAL(10,5)`. But the type name is emitted verbatim
+ * into DDL, so it must not be able to carry SQL metacharacters. This pattern
+ * allows the legitimate shapes and rejects `;`, quotes, comments, and
+ * parentheses beyond a numeric size.
+ */
+const SAFE_COLUMN_TYPE_RE = /^[A-Za-z_][A-Za-z0-9_ ]*(?:\(\s*\d+\s*(?:,\s*\d+\s*)?\))?$/;
+/** Runtime guard: is `type` a safe SQLite type name for DDL emission? */
+function isSafeColumnType(type) {
+    return typeof type === 'string' && SAFE_COLUMN_TYPE_RE.test(type);
+}
 function schemaHasReferences(schema) {
     return Object.values(schema.columns).some((col) => col.references !== undefined);
 }
@@ -50,6 +64,11 @@ function validateSchema(schema) {
         const col = schema.columns[name];
         if (!col.type) {
             errors.push(`Column "${name}" is missing a "type".`);
+        }
+        else if (!isSafeColumnType(col.type)) {
+            errors.push(`Column "${name}": unsupported/unsafe type "${col.type}". ` +
+                'Types must be a plain SQLite type name (letters, digits, spaces) with an optional ' +
+                'numeric size, e.g. TEXT, INTEGER, VARCHAR(255), UNSIGNED BIG INT.');
         }
         else if (!VALID_COLUMN_TYPES.has(col.type.toUpperCase())) {
             // SQLite accepts arbitrary type names (type affinity). Follow SQLite's
@@ -317,6 +336,12 @@ function escapeDefaultLiteral(value) {
  */
 function columnDDL(col) {
     const parts = [];
+    // The type is emitted verbatim, so reject anything that could carry SQL
+    // metacharacters even when a schema bypassed `define()`/`validateSchema`.
+    if (!isSafeColumnType(col.type)) {
+        throw new Error(`Invalid/unsafe column type: "${String(col.type)}". ` +
+            'Types must be a plain SQLite type name (letters, digits, spaces) with an optional numeric size.');
+    }
     parts.push(col.type.toUpperCase());
     if (col.primaryKey)
         parts.push('PRIMARY KEY');
@@ -550,10 +575,13 @@ class QueryBuilder {
             throw new Error(`Invalid orderBy direction: "${dir}". Expected "ASC" or "DESC".`);
         }
         if (isFragment(col)) {
-            this.#s.orderBys.push({ col: col.text, dir: d });
+            // Keep the fragment's bound params — ORDER BY can legitimately contain
+            // placeholders (e.g. CASE WHEN ? ...). Dropping them would silently bind
+            // them to NULL in node:sqlite instead of failing.
+            this.#s.orderBys.push({ col: col.text, dir: d, params: [...col.params] });
             return this;
         }
-        this.#s.orderBys.push({ col: quoteIdent(col), dir: d });
+        this.#s.orderBys.push({ col: quoteIdent(col), dir: d, params: [] });
         return this;
     }
     /** LIMIT the number of returned rows (bound as a parameter). */
@@ -621,6 +649,8 @@ class QueryBuilder {
         // ORDER BY
         if (this.#s.orderBys.length > 0) {
             parts.push(`ORDER BY ${this.#s.orderBys.map((o) => `${o.col} ${o.dir}`).join(', ')}`);
+            for (const o of this.#s.orderBys)
+                params.push(...o.params);
         }
         // LIMIT / OFFSET
         if (this.#s.limitV !== null) {
@@ -748,50 +778,45 @@ class QueryBuilder {
                 type: g.type,
                 fragments: [...g.fragments],
             })),
-            orderBys: [...this.#s.orderBys],
+            orderBys: this.#s.orderBys.map((o) => ({ ...o, params: [...o.params] })),
             limitV: this.#s.limitV,
             offsetV: this.#s.offsetV,
         };
         return copy;
     }
     #buildWhereClauses(groups, params, keyword = 'WHERE') {
-        if (groups.length === 0)
+        // Drop empty groups (e.g. `where({})`) BEFORE pairing conditions with
+        // operators. Previously an empty group was skipped while building the SQL
+        // but still consumed an index in the operator loop, so a later OR could be
+        // silently turned into an AND.
+        const nonEmpty = groups.filter((g) => g.fragments.length > 0);
+        if (nonEmpty.length === 0)
             return '';
-        const groupSqls = [];
-        for (const group of groups) {
-            const frags = group.fragments;
-            if (frags.length === 0)
-                continue;
-            const combined = frags
-                .map((f) => {
-                params.push(...f.params);
-                return f.text;
-            })
-                .join(' AND ');
-            groupSqls.push(combined);
-        }
-        if (groupSqls.length === 0)
-            return '';
+        const groupSqls = nonEmpty.map((group) => group.fragments
+            .map((f) => {
+            params.push(...f.params);
+            return f.text;
+        })
+            .join(' AND '));
         // Build group joining: consecutive groups with the same operator join naturally;
         // when the operator changes, parenthesize the accumulated result only if it is
         // already compound (multiple conditions), to avoid noisy single-condition parens.
         let result = groupSqls[0];
-        let lastOp = groups[0].type;
+        let lastOp = nonEmpty[0].type;
         let compound = result.includes(' AND ') || result.includes(' OR ');
-        for (let i = 1; i < groupSqls.length; i++) {
-            const op = groups[i].type;
+        for (let i = 1; i < nonEmpty.length; i++) {
+            const op = nonEmpty[i].type;
             const cur = groupSqls[i];
             if (op === lastOp) {
                 result += ` ${op} ${cur}`;
-                compound = true;
             }
             else {
                 if (compound)
                     result = `(${result})`;
                 result += ` ${op} ${cur}`;
-                compound = true;
                 lastOp = op;
             }
+            compound = true;
         }
         return `${keyword} ${result}`;
     }
@@ -821,8 +846,23 @@ class QueryBuilder {
             const placeholders = val.map(() => '?').join(', ');
             return { text: `${col} IN (${placeholders})`, params: extractValues(val) };
         }
+        // Binary column values (BLOB) are scalars, not operator objects. Without
+        // this they would be read as an operator map with numeric keys and throw
+        // "Unknown where operator: 0".
+        if (val instanceof Uint8Array) {
+            return { text: `${col} = ?`, params: [val] };
+        }
         // WhereOps object
         if (typeof val === 'object' && val !== null) {
+            // Only a plain object can describe operators. Anything else (Date, Map,
+            // Set, class instance, ...) is a mistake; silently treating it as an
+            // empty operator set used to produce `1` (match EVERY row) and turn a
+            // scoped update/delete into a full-table one.
+            if (!isPlainObject(val)) {
+                throw new Error(`Invalid WHERE value for column "${col}": expected a scalar, an array, a binary value, ` +
+                    `or an operator object, got ${describeValue(val)}. ` +
+                    'Wrap raw SQL expressions in a sql fragment instead.');
+            }
             const ops = val;
             const fragments = [];
             for (const [op, opVal] of Object.entries(ops)) {
@@ -833,7 +873,12 @@ class QueryBuilder {
                     fragments.push(f);
             }
             if (fragments.length === 0) {
-                return { text: '1', params: [] };
+                // An operator object with no effective operator must never degrade to
+                // a match-all condition: `{ eq: undefined }` would otherwise filter
+                // nothing and affect every row.
+                throw new Error(`Empty WHERE condition for column "${col}": an operator object must set at least ` +
+                    'one operator (eq, ne, gt, gte, lt, lte, like, notLike, glob, notGlob, in, notIn, ' +
+                    'between, is, isNot, isNull, notNull).');
             }
             // Multiple ops on same column: AND-join them
             const combined = fragments.map((f) => f.text).join(' AND ');
@@ -894,6 +939,24 @@ _a = QueryBuilder;
 // ---------------------------------------------------------------------------
 function extractValues(arr) {
     return arr;
+}
+/** Is `v` a plain object (object literal or `Object.create(null)`)? */
+function isPlainObject(v) {
+    if (typeof v !== 'object' || v === null)
+        return false;
+    const proto = Object.getPrototypeOf(v);
+    return proto === Object.prototype || proto === null;
+}
+/** Human-readable description of an unexpected WHERE value. */
+function describeValue(v) {
+    if (v instanceof Date)
+        return 'a Date';
+    if (v instanceof Map)
+        return 'a Map';
+    if (v instanceof Set)
+        return 'a Set';
+    const name = v?.constructor?.name;
+    return name && name !== 'Object' ? `an instance of ${name}` : typeof v;
 }
 /** Validate that an operator value is an array with a clear error message. */
 function requireArray(op, val) {
@@ -1021,10 +1084,12 @@ class Model {
      */
     insert(data) {
         validateKeys(this.#schema, this.table, data);
-        const { sql, values, isEmpty } = buildInsertSql(this.#schema, this.table, data);
+        const { sql, values } = buildInsertSql(this.#schema, this.table, data);
         const result = this.#exec.prepare(sql).run(...values);
-        const rid = isEmpty ? this.#lastInsertRowid() : result.lastInsertRowid;
-        const { sql: selSql, params } = resolveAfterInsertSql(this.#schema, this.table, data, rid);
+        // `run().lastInsertRowid` is correct even for INSERT ... DEFAULT VALUES.
+        // The old separate `SELECT last_insert_rowid()` read global connection
+        // state and could resolve another statement's row under concurrency.
+        const { sql: selSql, params } = resolveAfterInsertSql(this.#schema, this.table, data, result.lastInsertRowid);
         return this.#exec.prepare(selSql).get(...params);
     }
     /**
@@ -1193,11 +1258,6 @@ class Model {
     query() {
         return new QueryBuilder(this.#exec, this.table);
     }
-    // ---- Internal ----
-    #lastInsertRowid() {
-        const row = this.#exec.prepare('SELECT last_insert_rowid() AS "rid"').get();
-        return row?.rid ?? 0;
-    }
 }
 
 /**
@@ -1238,6 +1298,14 @@ function ensureMigrationTableSql(schema) {
 /**
  * SELECT listing applied migration names and timestamps, ordered by name.
  */
+/**
+ * SELECT 1 when the version table exists in the given schema. Lets
+ * `migrationStatus()` report status without creating the table as a side
+ * effect of a read-only call.
+ */
+function migrationTableExistsSql(schema) {
+    return `SELECT 1 AS "ok" FROM ${quoteIdent(schema)}.sqlite_master WHERE type = 'table' AND name = '_sqlo_migrations'`;
+}
 function getAppliedMigrationsSql(schema) {
     return `SELECT "name", "applied_at" FROM ${migrationTableRef(schema)} ORDER BY "name"`;
 }
@@ -1281,7 +1349,20 @@ function loadMigrationsSync(dir) {
                 throw new Error(`Cannot load .mjs migration synchronously: "${entry}". ` +
                     'Use loadMigrations() (async) instead.');
             }
-            const mod = _require(fullPath);
+            let mod;
+            try {
+                mod = _require(fullPath);
+            }
+            catch (err) {
+                const code = err.code;
+                // Node < 22.12 throws ERR_REQUIRE_ESM for any ESM file. Modern Node
+                // require()s ESM without top-level await, and throws
+                // ERR_REQUIRE_ASYNC_MODULE when it has top-level await. Map both.
+                if (code === 'ERR_REQUIRE_ESM' || code === 'ERR_REQUIRE_ASYNC_MODULE') {
+                    throw new Error(`Cannot load ESM migration "${entry}" synchronously. Use loadMigrations() (async) instead.`, { cause: err });
+                }
+                throw err;
+            }
             const result = mod.default ?? mod;
             if (Array.isArray(result)) {
                 migrations.push(...result);
@@ -1314,9 +1395,7 @@ async function loadMigrations(dir) {
             migrations.push({ name, up: sql });
         }
         else if (ext === 'js' || ext === 'mjs' || ext === 'cjs') {
-            const absUrl = ext === 'cjs'
-                ? fullPath
-                : `file://${fullPath}`;
+            const absUrl = pathToFileURL(fullPath).href;
             const mod = await import(absUrl);
             const result = mod.default ?? mod;
             if (Array.isArray(result)) {
@@ -1440,6 +1519,10 @@ function toBindables(params) {
 /**
  * Sqlo — the core class wrapping a `node:sqlite` DatabaseSync instance.
  */
+/** Runtime whitelist for `journalMode` — it is interpolated into a PRAGMA. */
+const JOURNAL_MODES = new Set([
+    'DELETE', 'TRUNCATE', 'PERSIST', 'MEMORY', 'WAL', 'OFF',
+]);
 // ---------------------------------------------------------------------------
 // Sqlo class
 // ---------------------------------------------------------------------------
@@ -1454,7 +1537,14 @@ function toBindables(params) {
 class Sqlo {
     #db;
     #options;
-    #models = new Map();
+    #baseColumns;
+    /**
+     * Every model defined on this connection, in definition order. A list (not a
+     * name→model map) so that re-defining a table — e.g. after `close()` +
+     * `open()` — never silently drops an earlier definition from syncAll().
+     * The generated DDL is `IF NOT EXISTS`, so repeats are harmless.
+     */
+    #models = [];
     #closed = false;
     /** Re-entry guard: prevents an `onLog` callback from triggering new log events. */
     #logging = false;
@@ -1469,6 +1559,10 @@ class Sqlo {
     constructor(options = {}) {
         const opts = typeof options === 'string' ? { path: options } : { ...options };
         const path = opts.path ?? ':memory:';
+        if (opts.journalMode !== undefined && !JOURNAL_MODES.has(opts.journalMode)) {
+            throw new Error(`Invalid journalMode: "${String(opts.journalMode)}". ` +
+                `Expected one of: ${[...JOURNAL_MODES].join(', ')}.`);
+        }
         this.#options = {
             path,
             open: opts.open ?? true,
@@ -1485,6 +1579,7 @@ class Sqlo {
             logLevel: opts.logLevel ?? 'warn',
             ...(opts.onLog !== undefined ? { onLog: opts.onLog } : {}),
         };
+        this.#baseColumns = opts.baseColumns ?? {};
         this.#db = new DatabaseSync(path, {
             open: this.#options.open,
             readBigInts: this.#options.readBigInts,
@@ -1563,6 +1658,9 @@ class Sqlo {
         if (dot > 0) {
             schema = name.slice(0, dot);
             table = name.slice(dot + 1);
+            if (table.includes('.')) {
+                throw new Error(`Invalid table name "${name}": expected "table" or "schema.table".`);
+            }
         }
         const sql = schema
             ? `SELECT 1 FROM ${quoteIdent(schema)}.sqlite_master WHERE type = 'table' AND tbl_name = ?`
@@ -1752,20 +1850,23 @@ class Sqlo {
             }
         }
     }
-    #transactionOnce(fn) {
+    #transactionOnce(fn, mode = 'DEFERRED') {
         this.#ensureOpen();
-        const isTop = this.#txDepth === 0;
+        const entryDepth = this.#txDepth;
+        const isTop = entryDepth === 0;
         if (isTop) {
-            this.#db.exec('BEGIN');
-            this.#log('transaction', 'BEGIN transaction');
+            // BEGIN IMMEDIATE acquires the write lock up front (used by migrate()).
+            this.#db.exec(mode === 'IMMEDIATE' ? 'BEGIN IMMEDIATE' : 'BEGIN');
+            this.#log('transaction', mode === 'IMMEDIATE' ? 'BEGIN IMMEDIATE transaction' : 'BEGIN transaction');
         }
         else {
-            this.#db.exec(`SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
-            this.#log('transaction', `BEGIN SAVEPOINT (depth ${this.#txDepth})`);
+            this.#db.exec(`SAVEPOINT "sqlo_sp_${entryDepth}"`);
+            this.#log('transaction', `BEGIN SAVEPOINT (depth ${entryDepth})`);
         }
-        this.#txDepth++;
+        this.#txDepth = entryDepth + 1;
+        let result;
         try {
-            const result = fn();
+            result = fn();
             // Guard the classic misuse: an async callback resolves AFTER this method
             // has returned, so awaiting inside it would silently run outside the
             // (already committed) transaction. Fail loudly instead.
@@ -1775,35 +1876,61 @@ class Sqlo {
                     'The synchronous API cannot keep a transaction open across awaits — ' +
                     'use AsyncSqlo.transaction() instead.');
             }
-            this.#txDepth--;
-            if (this.#txDepth === 0) {
-                this.#db.exec('COMMIT');
-                this.#log('transaction', 'COMMIT transaction');
-            }
-            else {
-                this.#db.exec(`RELEASE SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
-                this.#log('transaction', `RELEASE SAVEPOINT (depth ${this.#txDepth})`);
-            }
-            return result;
         }
         catch (err) {
-            this.#txDepth--;
             try {
-                if (this.#txDepth === 0) {
+                if (isTop) {
                     this.#db.exec('ROLLBACK');
                     this.#log('transaction', 'ROLLBACK transaction', { level: 'warn' });
                 }
                 else {
-                    this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
-                    this.#log('transaction', `ROLLBACK TO SAVEPOINT (depth ${this.#txDepth})`, { level: 'warn' });
+                    this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${entryDepth}"`);
+                    this.#log('transaction', `ROLLBACK TO SAVEPOINT (depth ${entryDepth})`, { level: 'warn' });
                 }
             }
             catch {
                 // The rollback itself failed (e.g. the failing statement already
                 // aborted the transaction). Never let that mask the original error.
             }
+            finally {
+                // Always restore the depth exactly once, whatever the rollback did.
+                this.#txDepth = entryDepth;
+            }
             throw err;
         }
+        // fn succeeded — finish the transaction. If COMMIT/RELEASE itself fails
+        // (SQLITE_BUSY, deferred FK, disk full, ...) SQLite leaves the transaction
+        // open; roll it back and restore the depth so the connection is never left
+        // inside an orphaned transaction that would silently swallow later writes.
+        try {
+            if (isTop) {
+                this.#db.exec('COMMIT');
+                this.#log('transaction', 'COMMIT transaction');
+            }
+            else {
+                this.#db.exec(`RELEASE SAVEPOINT "sqlo_sp_${entryDepth}"`);
+                this.#log('transaction', `RELEASE SAVEPOINT (depth ${entryDepth})`);
+            }
+        }
+        catch (err) {
+            try {
+                if (isTop) {
+                    this.#db.exec('ROLLBACK');
+                    this.#log('transaction', 'ROLLBACK transaction after failed COMMIT', { level: 'warn' });
+                }
+                else {
+                    this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${entryDepth}"`);
+                    this.#log('transaction', `ROLLBACK TO SAVEPOINT (depth ${entryDepth}) after failed RELEASE`, { level: 'warn' });
+                }
+            }
+            catch {
+                // Best effort — the original COMMIT/RELEASE error is what matters.
+            }
+            this.#txDepth = entryDepth;
+            throw err;
+        }
+        this.#txDepth = entryDepth;
+        return result;
     }
     // ---- Multiple databases (ATTACH / DETACH) ----
     /**
@@ -1821,6 +1948,12 @@ class Sqlo {
      */
     attach(path, name) {
         this.#ensureOpen();
+        // The schema name cannot be a bound parameter — validate it. `quoteIdent`
+        // rejects invalid identifiers; we additionally reject dotted names because
+        // ATTACH AS expects a single, dot-free database name.
+        if (name.includes('.')) {
+            throw new Error(`Invalid database name: "${name}". ATTACH requires a plain name without dots.`);
+        }
         const ident = quoteIdent(name);
         // The schema name cannot be a bound parameter — it's an identifier, so
         // it is validated and quoted; the file path is always bound.
@@ -1854,10 +1987,13 @@ class Sqlo {
      */
     define(schema) {
         this.#ensureOpen();
+        // Merge the connection-wide base columns into this schema (schema's own
+        // columns win on name collisions) before validation and DDL generation.
+        const merged = this.#withBaseColumns(schema);
         // Validate the schema
-        const { errors, warnings } = validateSchema(schema);
+        const { errors, warnings } = validateSchema(merged);
         if (errors.length > 0) {
-            throw new Error(`Invalid schema for table "${schema.name}":\n  ${errors.join('\n  ')}`);
+            throw new Error(`Invalid schema for table "${merged.name}":\n  ${errors.join('\n  ')}`);
         }
         for (const warning of warnings) {
             process.emitWarning(warning, { code: 'SQLO_SCHEMA_WARNING' });
@@ -1865,24 +2001,30 @@ class Sqlo {
         // Foreign keys: warn when the schema declares references but the
         // connection has foreign-key enforcement disabled — the declared
         // ON DELETE / ON UPDATE actions would silently not fire.
-        if (!this.#options.enableForeignKeyConstraints && schemaHasReferences(schema)) {
-            process.emitWarning(`Table "${schema.name}" declares foreign key references but the connection has ` +
+        if (!this.#options.enableForeignKeyConstraints && schemaHasReferences(merged)) {
+            process.emitWarning(`Table "${merged.name}" declares foreign key references but the connection has ` +
                 'foreign key enforcement disabled (enableForeignKeyConstraints: false). ' +
                 'ON DELETE / ON UPDATE actions will NOT fire. Enable the option to enforce them.', { code: 'SQLO_FOREIGN_KEYS_DISABLED' });
         }
-        const model = new Model(this, schema);
-        this.#models.set(schema.name, model);
-        this.#log('schema', `define model for "${schema.name}"`, {
-            detail: `${Object.keys(schema.columns).length} columns, ${schema.indexes?.length ?? 0} indexes`,
+        const model = new Model(this, merged);
+        this.#models.push(model);
+        this.#log('schema', `define model for "${merged.name}"`, {
+            detail: `${Object.keys(merged.columns).length} columns, ${merged.indexes?.length ?? 0} indexes`,
         });
         return model;
+    }
+    #withBaseColumns(schema) {
+        const base = this.#baseColumns;
+        if (Object.keys(base).length === 0)
+            return schema;
+        return { ...schema, columns: { ...base, ...schema.columns } };
     }
     /**
      * Create all defined tables and indexes.
      */
     syncAll() {
         this.#ensureOpen();
-        for (const model of this.#models.values()) {
+        for (const model of this.#models) {
             model.sync();
         }
     }
@@ -1907,53 +2049,46 @@ class Sqlo {
         this.#ensureMigrationTable(schema);
         const applied = this.#getAppliedMigrations(schema);
         const pending = computePending(migrations, applied);
+        const freshlyApplied = [];
         for (const m of pending) {
-            // Participate in an outer transaction when present (nested via SAVEPOINT),
-            // otherwise open a dedicated transaction per migration so that already
-            // applied migrations survive a later failure.
-            if (this.#txDepth === 0) {
-                this.#db.exec('BEGIN');
-            }
-            else {
-                this.#db.exec(`SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
-            }
-            this.#txDepth++;
+            // Each migration gets its own transaction (or a SAVEPOINT inside an
+            // outer one). BEGIN IMMEDIATE makes two processes racing to migrate the
+            // same database serialize on the write lock; re-checking inside the
+            // transaction closes the window where the other process committed while
+            // we were waiting for the lock.
+            let alreadyApplied = false;
             try {
-                this.#applyMigration(m, schema);
-                this.#log('migrate', `applied migration "${m.name}"`, { detail: `schema "${schema}"` });
-                this.#txDepth--;
-                if (this.#txDepth === 0) {
-                    this.#db.exec('COMMIT');
-                }
-                else {
-                    this.#db.exec(`RELEASE SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
-                }
+                this.#transactionOnce(() => {
+                    if (this.#getAppliedMigrations(schema).has(m.name)) {
+                        alreadyApplied = true;
+                        return;
+                    }
+                    this.#applyMigration(m, schema);
+                }, 'IMMEDIATE');
             }
             catch (err) {
-                this.#txDepth--;
                 this.#log('migrate', `migration "${m.name}" failed`, { detail: `schema "${schema}"`, level: 'error' });
-                try {
-                    if (this.#txDepth === 0) {
-                        this.#db.exec('ROLLBACK');
-                    }
-                    else {
-                        this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
-                    }
-                }
-                catch {
-                    // Rollback already handled by the failing statement — keep going.
-                }
                 const scope = this.#txDepth === 0 ? 'transaction rolled back' : 'rolled back to savepoint';
                 throw new Error(`Migration "${m.name}" failed (${scope}).`, { cause: err });
             }
+            if (alreadyApplied) {
+                this.#log('migrate', `migration "${m.name}" already applied by another process`, {
+                    detail: `schema "${schema}"`,
+                    level: 'warn',
+                });
+            }
+            else {
+                freshlyApplied.push(m);
+                this.#log('migrate', `applied migration "${m.name}"`, { detail: `schema "${schema}"` });
+            }
         }
-        if (pending.length > 0) {
-            this.#log('migrate', `applied ${pending.length} migration(s)`, { detail: `schema "${schema}"` });
+        if (freshlyApplied.length > 0) {
+            this.#log('migrate', `applied ${freshlyApplied.length} migration(s)`, { detail: `schema "${schema}"` });
         }
         else {
             this.#log('migrate', 'no pending migrations', { detail: `schema "${schema}"` });
         }
-        return pending;
+        return freshlyApplied;
     }
     /**
      * List all migrations with their applied status.
@@ -1962,8 +2097,11 @@ class Sqlo {
     migrationStatus(migrations, options) {
         this.#ensureOpen();
         const schema = options?.schema ?? 'main';
-        this.#ensureMigrationTable(schema);
-        const applied = this.#getAppliedMigrations(schema);
+        // Read-only: do NOT create the version table here — a status query must
+        // not mutate the database.
+        const applied = this.#migrationTableExists(schema)
+            ? this.#getAppliedMigrations(schema)
+            : new Map();
         return migrations.map((m) => ({
             name: m.name,
             appliedAt: applied.get(m.name) ?? null,
@@ -2018,6 +2156,10 @@ class Sqlo {
     #ensureMigrationTable(schema) {
         this.#db.exec(ensureMigrationTableSql(schema));
     }
+    #migrationTableExists(schema) {
+        const row = this.#db.prepare(migrationTableExistsSql(schema)).get();
+        return row !== undefined;
+    }
     #getAppliedMigrations(schema) {
         const rows = this.#db.prepare(getAppliedMigrationsSql(schema)).all();
         const map = new Map();
@@ -2032,7 +2174,16 @@ class Sqlo {
             this.#db.exec(m.up);
         }
         else {
-            m.up({ exec: (sql) => this.#db.exec(sql) });
+            const result = m.up({ exec: (sql) => this.#db.exec(sql) });
+            if (result !== null && typeof result === 'object' &&
+                typeof result.then === 'function') {
+                // Swallow the async rejection we are about to orphan; the clear
+                // synchronous error below is what the caller must see. Recording the
+                // migration as applied (the old behaviour) would be a silent lie.
+                void result.catch(() => { });
+                throw new TypeError(`Migration "${m.name}" returned a Promise from an async up(). ` +
+                    'The synchronous Sqlo.migrate() cannot await it — use a synchronous up() or AsyncSqlo.migrate().');
+            }
         }
         this.#db.prepare(insertMigrationRecordSql(schema)).run(m.name, ts);
     }
@@ -2084,6 +2235,8 @@ class MultiSqlo {
     #migrations;
     #options;
     #fileName;
+    #maxOpen;
+    /** Map iteration order is LRU order: oldest first, most-recent last. */
     #instances = new Map();
     /**
      * @param opts Directory to store per-user databases, baseline migrations,
@@ -2094,6 +2247,11 @@ class MultiSqlo {
         this.#migrations = opts.migrations ?? [];
         this.#options = opts.options;
         this.#fileName = opts.fileName ?? ((userId) => `${userId}.db`);
+        const maxOpen = opts.maxOpen ?? 100;
+        if (maxOpen !== Infinity && (!Number.isInteger(maxOpen) || maxOpen < 1)) {
+            throw new Error(`Invalid maxOpen: ${String(opts.maxOpen)}. Expected a positive integer or Infinity.`);
+        }
+        this.#maxOpen = maxOpen;
         mkdirSync(this.#dir, { recursive: true });
     }
     /**
@@ -2108,13 +2266,38 @@ class MultiSqlo {
                 'Must match /^[A-Za-z0-9][A-Za-z0-9._-]*$/ to be used as a file name.');
         }
         const cached = this.#instances.get(userId);
-        if (cached)
+        if (cached) {
+            // LRU touch: re-insert so this user becomes the most-recently used.
+            this.#instances.delete(userId);
+            this.#instances.set(userId, cached);
             return cached;
+        }
         const fileName = this.#fileName(userId);
-        if (fileName.includes('/') || fileName.includes('\\') || fileName === '..' || fileName === '.') {
-            throw new Error(`fileName() for "${userId}" must be a plain file name, got "${fileName}".`);
+        if (typeof fileName !== 'string' ||
+            fileName.length === 0 ||
+            fileName.includes('/') ||
+            fileName.includes('\\') ||
+            // ':' blocks Windows drive-relative paths (e.g. "C:evil") that
+            // path.join() would otherwise resolve outside the pool directory.
+            fileName.includes(':') ||
+            fileName.includes('\0') ||
+            fileName === '..' ||
+            fileName === '.') {
+            throw new Error(`fileName() for "${userId}" must be a plain file name, got "${String(fileName)}".`);
         }
         const path = join(this.#dir, fileName);
+        // Bound the number of open file descriptors / per-connection memory in
+        // multi-tenant deployments with many distinct users. Evict the oldest
+        // (least-recently used) connection before opening a new one. Done only
+        // after `fileName` is validated, so a bad file name has no side effect.
+        while (this.#instances.size >= this.#maxOpen) {
+            const oldest = this.#instances.keys().next().value;
+            if (oldest === undefined)
+                break;
+            const evicted = this.#instances.get(oldest);
+            this.#instances.delete(oldest);
+            evicted?.close();
+        }
         const db = new Sqlo({ path, ...(this.#options ?? {}) });
         // Migrations are applied unconditionally and idempotently: the version
         // table records what is already applied, so this is a no-op for migrated
@@ -2122,7 +2305,15 @@ class MultiSqlo {
         // behind before its baseline migrations finished (the old "file is new"
         // check skipped migration in exactly that case).
         if (this.#migrations.length > 0) {
-            db.migrate(this.#migrations);
+            try {
+                db.migrate(this.#migrations);
+            }
+            catch (err) {
+                // Bootstrap failed — never leak the just-opened connection. It was
+                // not registered in the cache, so closeAll() could not close it.
+                db.close();
+                throw err;
+            }
         }
         this.#instances.set(userId, db);
         return db;
@@ -2402,16 +2593,23 @@ function reflectRaw(exec, table) {
     const indexes = [];
     for (const idx of idxRows) {
         if (idx.origin === 'u') {
-            // UNIQUE constraint → surface as `unique: true` on the column,
-            // not as a standalone index.
+            // UNIQUE constraint → single column becomes `unique: true` on the
+            // column; a multi-column constraint is preserved as a unique index (it
+            // used to be dropped entirely, so schemaDiff kept trying to re-add it).
             const info = exec.prepare(`PRAGMA ${schemaIdent}.index_info(${quoteIdent(idx.name)})`).all();
-            const cols = info.sort((a, b) => a.seqno - b.seqno).map((i) => i.name);
-            if (cols.length === 1 && cols[0] !== null) {
+            const cols = info
+                .sort((a, b) => a.seqno - b.seqno)
+                .map((i) => i.name)
+                .filter((n) => n !== null);
+            if (cols.length === 1) {
                 const col = columns[cols[0]];
                 if (col)
                     col.unique = true;
-                continue;
             }
+            else if (cols.length > 1) {
+                indexes.push({ name: idx.name, columns: cols, unique: true });
+            }
+            continue;
         }
         // origin 'pk' (primary key) is already captured in column definitions.
         if (idx.origin !== 'c')
@@ -2445,7 +2643,7 @@ function reflectRaw(exec, table) {
     const sqlRow = exec.prepare(`SELECT sql FROM ${master} WHERE type = ? AND name = ?`).get('table', name);
     if (sqlRow?.sql) {
         const stripped = stripQuoted(sqlRow.sql);
-        strict = /\bSTRICT\b/.test(stripped);
+        strict = /\bSTRICT\b/i.test(stripped);
         withoutRowId = /\bWITHOUT\s+ROWID\b/i.test(stripped);
     }
     return {
@@ -2758,10 +2956,12 @@ class AsyncModel {
      */
     async insert(data) {
         validateKeys(this.#schema, this.table, data);
-        const { sql, values, isEmpty } = buildInsertSql(this.#schema, this.table, data);
+        const { sql, values } = buildInsertSql(this.#schema, this.table, data);
         const result = await this.#exec.run(sql, ...values);
-        const rid = isEmpty ? await this.#lastInsertRowid() : result.lastInsertRowid;
-        const { sql: selSql, params } = resolveAfterInsertSql(this.#schema, this.table, data, rid);
+        // `run().lastInsertRowid` is correct even for INSERT ... DEFAULT VALUES,
+        // and — unlike a separate `SELECT last_insert_rowid()` RPC — it is bound to
+        // this statement, so concurrent inserts cannot resolve each other's row.
+        const { sql: selSql, params } = resolveAfterInsertSql(this.#schema, this.table, data, result.lastInsertRowid);
         return (await this.#exec.get(selSql, ...params));
     }
     /**
@@ -2918,11 +3118,6 @@ class AsyncModel {
     withExecutor(exec) {
         return new AsyncModel(exec, this.#schema);
     }
-    // ---- Internal ----
-    async #lastInsertRowid() {
-        const row = await this.#exec.get('SELECT last_insert_rowid() AS "rid"');
-        return row?.rid ?? 0;
-    }
 }
 
 /**
@@ -2947,9 +3142,6 @@ class AsyncModel {
  */
 const __filename$1 = fileURLToPath(import.meta.url);
 const __dirname$1 = dirname(__filename$1);
-// ---------------------------------------------------------------------------
-// AsyncSqlo
-// ---------------------------------------------------------------------------
 /**
  * Async wrapper around Sqlo that delegates database operations to a worker
  * thread, avoiding event-loop blocking in request-handling contexts.
@@ -2966,7 +3158,8 @@ const __dirname$1 = dirname(__filename$1);
 class AsyncSqlo {
     #worker;
     #pending = new Map();
-    #models = new Map();
+    /** Every model defined on this connection (see the sync `Sqlo`). */
+    #models = [];
     #nextId = 1;
     /**
      * Active transaction nesting depth on this connection. While > 0, ordinary
@@ -2975,6 +3168,12 @@ class AsyncSqlo {
      * it on the FIFO lane, where an awaited call would deadlock the transaction.
      */
     #txDepth = 0;
+    /**
+     * Async context of the currently running transaction callback. Operations
+     * awaited from that context join the transaction; operations from any other
+     * context (another concurrent request on the same connection) are queued.
+     */
+    #txContext = new AsyncLocalStorage();
     /**
      * Worker liveness. Once the worker has errored or exited, every future
      * `#send` fails fast instead of posting a message that would never be
@@ -2992,6 +3191,7 @@ class AsyncSqlo {
      */
     #tail = Promise.resolve();
     #fkEnabled;
+    #baseColumns;
     /**
      * @param path Database file path (or `':memory:'`) opened inside the worker.
      * @param options Options forwarded to the worker's `DatabaseSync`
@@ -3000,6 +3200,8 @@ class AsyncSqlo {
      *   same behaviour as the synchronous `Sqlo`. Foreign-key enforcement
      *   defaults to `true` (matching the synchronous `Sqlo`), so `define()` can
      *   warn when it is disabled while the schema declares references.
+     *   `baseColumns` are kept on the main thread and merged into every
+     *   `define()` schema — they are never sent to the worker.
      */
     constructor(path, options) {
         // Align the foreign-key default with the sync Sqlo (#60): enforcement is
@@ -3007,13 +3209,17 @@ class AsyncSqlo {
         // remember it here for the define() warning.
         const fkEnabled = options?.enableForeignKeyConstraints !== false;
         this.#fkEnabled = fkEnabled;
+        this.#baseColumns = options?.baseColumns ?? {};
+        // baseColumns are a main-thread concern — strip them so they never reach
+        // the worker's DatabaseSync options.
+        const { baseColumns: _baseColumns, ...forwarded } = options ?? {};
         // busyTimeout defaults to 5000ms for parity with the sync Sqlo; an
         // explicit value (including 0) wins. Resolve the default BEFORE the spread
         // so an explicit `busyTimeout: undefined` can't punch through and leave
         // the worker with SQLite's raw fail-fast default (0) while the sync Sqlo
         // would apply 5000ms.
         const workerOptions = {
-            ...options,
+            ...forwarded,
             busyTimeout: options?.busyTimeout ?? 5000,
             enableForeignKeyConstraints: fkEnabled,
         };
@@ -3091,7 +3297,12 @@ class AsyncSqlo {
      * awaits it.
      */
     #dispatch(op, sql, params = []) {
-        if (this.#txDepth > 0) {
+        // Only operations issued from within the transaction callback's async
+        // context join the open transaction. Anything else — e.g. another
+        // concurrent request sharing this connection — is queued on the FIFO lane,
+        // so it can never be silently rolled back or committed with someone
+        // else's work. See #transactionOnce for where the context is established.
+        if (this.#txDepth > 0 && this.#txContext.getStore() === true) {
             return this.#send(op, sql, params);
         }
         return this.#enqueue(() => this.#send(op, sql, params));
@@ -3150,10 +3361,13 @@ class AsyncSqlo {
      * Does **not** create the table — call `users.sync()` or `db.syncAll()`.
      */
     define(schema) {
+        // Merge the connection-wide base columns into this schema (schema's own
+        // columns win on name collisions) before validation and DDL generation.
+        const merged = this.#withBaseColumns(schema);
         // Validate the schema
-        const { errors, warnings } = validateSchema(schema);
+        const { errors, warnings } = validateSchema(merged);
         if (errors.length > 0) {
-            throw new Error(`Invalid schema for table "${schema.name}":\n  ${errors.join('\n  ')}`);
+            throw new Error(`Invalid schema for table "${merged.name}":\n  ${errors.join('\n  ')}`);
         }
         for (const warning of warnings) {
             process.emitWarning(warning, { code: 'SQLO_SCHEMA_WARNING' });
@@ -3161,22 +3375,28 @@ class AsyncSqlo {
         // Foreign keys: warn when the schema declares references but the
         // connection has foreign-key enforcement disabled — the declared
         // ON DELETE / ON UPDATE actions would silently not fire.
-        if (!this.#fkEnabled && schemaHasReferences(schema)) {
-            process.emitWarning(`Table "${schema.name}" declares foreign key references but the connection has ` +
+        if (!this.#fkEnabled && schemaHasReferences(merged)) {
+            process.emitWarning(`Table "${merged.name}" declares foreign key references but the connection has ` +
                 'foreign key enforcement disabled (enableForeignKeyConstraints: false). ' +
                 'ON DELETE / ON UPDATE actions will NOT fire. Enable the option to enforce them.', { code: 'SQLO_FOREIGN_KEYS_DISABLED' });
         }
-        const model = new AsyncModel(this, schema);
-        this.#models.set(schema.name, model);
+        const model = new AsyncModel(this, merged);
+        this.#models.push(model);
         return model;
     }
     /**
      * Create all defined tables and indexes.
      */
     async syncAll() {
-        for (const model of this.#models.values()) {
+        for (const model of this.#models) {
             await model.sync();
         }
+    }
+    #withBaseColumns(schema) {
+        const base = this.#baseColumns;
+        if (Object.keys(base).length === 0)
+            return schema;
+        return { ...schema, columns: { ...base, ...schema.columns } };
     }
     // ---- Transaction ----
     /**
@@ -3236,21 +3456,30 @@ class AsyncSqlo {
             }
         }
     }
-    async #transactionOnce(fn) {
-        await this.#send('txBegin', '');
+    async #transactionOnce(fn, immediate = false) {
+        await this.#send(immediate ? 'txBeginImmediate' : 'txBegin', '');
         this.#txDepth++;
         const tx = this.#makeTransaction();
+        let commitStarted = false;
         try {
-            const result = await fn(tx);
+            // `AsyncLocalStorage` scopes every awaited continuation of the callback
+            // to this transaction, so db-bound operations issued here join it while
+            // unrelated concurrent flows are queued (see #dispatch).
+            const result = await this.#txContext.run(true, () => fn(tx));
+            commitStarted = true;
             await this.#send('txCommit', '');
             return result;
         }
         catch (err) {
-            try {
-                await this.#send('txRollback', '');
-            }
-            catch {
-                // A failed rollback must not mask the original error.
+            // If txCommit itself failed, the worker already unwound the transaction;
+            // sending a rollback would only desync its depth.
+            if (!commitStarted) {
+                try {
+                    await this.#send('txRollback', '');
+                }
+                catch {
+                    // A failed rollback must not mask the original error.
+                }
             }
             throw err;
         }
@@ -3298,17 +3527,28 @@ class AsyncSqlo {
         for (const row of rows)
             applied.set(row.name, row.applied_at);
         const pending = computePending(migrations, applied);
+        const freshlyApplied = [];
         for (const m of pending) {
+            let alreadyApplied = false;
             try {
-                await this.transaction(async (tx) => {
+                // BEGIN IMMEDIATE serializes concurrent migrators on the write lock;
+                // re-checking inside the transaction closes the race window.
+                await this.#transactionOnce(async (tx) => {
+                    const rows = await tx.all(getAppliedMigrationsSql(schema));
+                    if (rows.some((r) => r.name === m.name)) {
+                        alreadyApplied = true;
+                        return;
+                    }
                     await this.#applyMigration(tx, m, schema);
-                });
+                }, true);
             }
             catch (err) {
                 throw new Error(`Migration "${m.name}" failed. DB has been rolled back.`, { cause: err });
             }
+            if (!alreadyApplied)
+                freshlyApplied.push(m);
         }
-        return pending;
+        return freshlyApplied;
     }
     async #applyMigration(tx, m, schema) {
         const ts = new Date().toISOString();
@@ -3327,11 +3567,14 @@ class AsyncSqlo {
      */
     async migrationStatus(migrations, options) {
         const schema = options?.schema ?? 'main';
-        await this.exec(ensureMigrationTableSql(schema));
-        const rows = await this.all(getAppliedMigrationsSql(schema));
+        // Read-only: never create the version table as a side effect.
+        const exists = await this.get(migrationTableExistsSql(schema));
         const applied = new Map();
-        for (const row of rows)
-            applied.set(row.name, row.applied_at);
+        if (exists !== undefined) {
+            const rows = await this.all(getAppliedMigrationsSql(schema));
+            for (const row of rows)
+                applied.set(row.name, row.applied_at);
+        }
         return migrations.map((m) => ({
             name: m.name,
             appliedAt: applied.get(m.name) ?? null,

@@ -147,10 +147,14 @@ export class Model<Row extends Record<string, unknown>, Insert, Patch> {
    */
   insert(data: Insert): Row {
     validateKeys(this.#schema, this.table, data);
-    const { sql, values, isEmpty } = buildInsertSql(this.#schema, this.table, data);
+    const { sql, values } = buildInsertSql(this.#schema, this.table, data);
     const result = this.#exec.prepare(sql).run(...values);
-    const rid = isEmpty ? this.#lastInsertRowid() : result.lastInsertRowid;
-    const { sql: selSql, params } = resolveAfterInsertSql(this.#schema, this.table, data, rid);
+    // `run().lastInsertRowid` is correct even for INSERT ... DEFAULT VALUES.
+    // The old separate `SELECT last_insert_rowid()` read global connection
+    // state and could resolve another statement's row under concurrency.
+    const { sql: selSql, params } = resolveAfterInsertSql(
+      this.#schema, this.table, data, result.lastInsertRowid,
+    );
     return this.#exec.prepare(selSql).get(...params) as Row;
   }
 
@@ -347,12 +351,5 @@ export class Model<Row extends Record<string, unknown>, Insert, Patch> {
    */
   query(): QueryBuilder<Row> {
     return new QueryBuilder<Row>(this.#exec, this.table);
-  }
-
-  // ---- Internal ----
-
-  #lastInsertRowid(): number | bigint {
-    const row = this.#exec.prepare('SELECT last_insert_rowid() AS "rid"').get() as { rid: number | bigint } | undefined;
-    return row?.rid ?? 0;
   }
 }

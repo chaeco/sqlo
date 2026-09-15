@@ -16,6 +16,14 @@ the built‑in [`node:sqlite`](https://nodejs.org/api/sqlite.html) module.
 
 > Requires **Node.js ≥ 22.5.0** (the version where `node:sqlite` shipped).
 
+> **Stability.** Sqlo is pre-1.0. It is built on Node's
+> [`node:sqlite`](https://nodejs.org/api/sqlite.html), which Node currently
+> marks **experimental** — the API may change between Node releases. Pin your
+> Node version in production and follow the Node changelog.
+>
+> **Support matrix.** Node.js 22.5+ and 24, on Linux, macOS and Windows
+> (CI runs the full suite on all three).
+
 ---
 
 ## Why Sqlo?
@@ -62,6 +70,8 @@ const users = db.define({
 //   readBigInts                     : read INTEGER columns as bigint (default false)
 //   enableDoubleQuotedStringLiterals: passed through to node:sqlite
 //   allowExtension                  : passed through to node:sqlite
+//   baseColumns                     : shared columns merged into every define() schema
+//                                     (e.g. id, created_at) — see "Shared base columns"
 
 // DDL is explicit — the ORM never auto-creates tables.
 users.sync();
@@ -137,6 +147,41 @@ structural mistakes in your JSON (a column missing `type`, an index on an
 unknown column, …) throw immediately with the file path instead of surfacing
 later at `define()`. Note that a JSON schema cannot express bound-parameter
 fragments — CHECK / WHERE constraints must be plain SQL strings there.
+
+### Shared base columns
+
+Tables that share the usual bookkeeping columns (`id`, `created_at`, …) can
+declare them **once** on the connection instead of repeating them in every
+schema. Pass `baseColumns` in the constructor options; the columns are merged
+into each `define()` schema before validation and DDL generation:
+
+```ts
+import { Sqlo, sql } from '@chaeco/sqlo';
+
+const db = new Sqlo({
+  path: ':memory:',
+  baseColumns: {
+    id:         { type: 'INTEGER', primaryKey: true, autoIncrement: true },
+    created_at: { type: 'TEXT', notNull: true,
+                  default: sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))` },
+  },
+});
+
+// The schema only declares its own columns — id and created_at are added.
+const users = db.define({
+  name: 'users',
+  columns: { name: { type: 'TEXT', notNull: true } },
+});
+// users row type: { id: number; created_at: string; name: string }
+
+users.sync(); // creates id, created_at, name
+```
+
+The merged columns are fully typed: `RowOf` / `InsertOf` / `PatchOf` include
+them, and insert inputs leave the base columns optional (autoincrement /
+defaults fill them). A column with the **same name declared directly on a
+schema overrides** the base definition for that schema. `AsyncSqlo` and
+`MultiSqlo` accept `baseColumns` the same way.
 
 Supported column types include `INTEGER`, `REAL`, `TEXT`, `BLOB`, `NUMERIC`,
 `BOOLEAN`, `DATE`, `DATETIME`, `TIMESTAMP`, and friends. The mapped JavaScript
@@ -226,6 +271,11 @@ awaits (that is what `AsyncSqlo.transaction()` is for).
 `update()` and `delete()` **require** a WHERE condition — they throw rather
 than let you wipe or overwrite an entire table by accident. For intentional
 bulk operations, use `db.exec('UPDATE ...')` with a `sql\`...\`` fragment.
+
+WHERE conditions that cannot be safely bound — an empty operator object
+(`{}`), an all-`undefined` operator object, or a non-plain object such as a
+`Date` — also throw, so a mistaken condition can never silently degrade into
+a match-all.
 
 ## Query builder
 
@@ -593,6 +643,19 @@ db.transaction(() => {
 }, { retry: 5 });   // survives transient write contention
 ```
 
+### One synchronous connection per process
+
+Synchronous `node:sqlite` calls block the JavaScript thread — and so do both
+`busy_timeout` and `transaction({ retry })`, which wait inside that thread.
+If two `Sqlo` connections in the **same process** contend for the write lock,
+the connection holding the lock cannot run its `COMMIT` while the other is
+blocked waiting, so the wait can only run out. Cross-process contention (the
+usual multi-writer setup) is unaffected.
+
+Guidance: use one `Sqlo` connection per process. If you need concurrency or a
+non-blocking caller, use `AsyncSqlo` — its worker thread plus non-blocking
+backoff keep the event loop free.
+
 ### Batching large inserts
 
 `insertMany(rows, { chunkSize })` inserts in chunks, each chunk in its own
@@ -770,6 +833,14 @@ Security: `userId` is validated against `^[A-Za-z0-9][A-Za-z0-9._-]*$` to
 prevent path traversal, and the file name must never contain path
 separators. You can customize the file naming with a `fileName` option.
 
+Connections are cached per user and bounded by `maxOpen` (default `100`):
+once the cap is reached, the least-recently-used user's connection is
+**closed** and evicted before a new one opens, so a server hosting many
+distinct tenants cannot run out of file descriptors. A reference you still
+hold to an evicted connection throws on its next use — call
+`pool.for(userId)` again to reopen. Pass `maxOpen: Infinity` to disable
+eviction.
+
 ## API reference
 
 ### Classes
@@ -826,6 +897,21 @@ separators. You can customize the file naming with a `fileName` option.
 - ❌ Simulated cross‑process locks
 - ❌ Forced asynchrony
 - ❌ Third‑party native packages as a default
+
+## Development
+
+```sh
+npm install
+npm run build            # bundle to dist/ (committed; JS consumers need no build)
+npm test                 # build + full test suite
+npm run typecheck        # tsc --noEmit
+npm run lint             # ESLint
+npm run test:coverage    # tests + coverage gate (lines 99 / branches 94 / functions 98)
+npm run bench            # local micro-benchmarks (not run in CI)
+```
+
+Tests run against the built `dist/`, so `npm test` always rebuilds first. CI
+runs on Node 22 and 24 across Linux, macOS and Windows.
 
 ## License
 

@@ -98,7 +98,8 @@ users.insertMany([
   { name: 'carol', email: 'carol@example.com', age: 35 },
 ]);
 
-console.log('findById(1):', users.findById(1));
+const found: User | undefined = users.findById(1);
+console.log('findById(1):', found);
 console.log('findOne({ email }):', users.findOne({ email: 'bob@example.com' }));
 
 const updated = users.update({ age: 31 }, { id: u.id });
@@ -135,7 +136,7 @@ console.log('编译 SQL:', sqlText, 'params:', params);
 // 6. 联表查询
 // ---------------------------------------------------------------------------
 
-const post = posts.insert({ userId: u.id, title: 'Hello Sqlo' });
+posts.insert({ userId: u.id, title: 'Hello Sqlo' });
 posts.insert({ userId: u.id, title: 'Second post', status: 'published' });
 
 const joined = posts

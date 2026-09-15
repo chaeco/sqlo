@@ -5,6 +5,100 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.0] - 2026-09-15
+
+本次为一次全面审计后的修复版本，包含若干**破坏性行为变更**（见“Changed”），
+发布前请阅读。
+
+### Security
+
+- **列类型进入 DDL 前强制校验** — 新增 `isSafeColumnType`：列类型必须是
+  `[A-Za-z_][A-Za-z0-9_ ]*` 可选 `(n)` / `(n, m)` 的形式，`;`、引号、注释、
+  越界括号等一律判为错误（此前仅告警），`validateSchema` 与 `columnDDL` 双层
+  拦截，DDL 注入不再是可达路径。
+- **`journalMode` 白名单校验** — 同步构造器此前可经该选项注入 PRAGMA；现在只
+  接受已知的 journal mode，非法值立即抛错（异步侧原本已校验）。
+
+### Fixed
+
+- **事务提交失败导致深度损坏与静默丢数据（P0）** — 重写同步 `#transactionOnce`：
+  事务深度只在 `COMMIT` / `RELEASE` 成功后复位，失败时先回滚再精确恢复深度；
+  异步 worker 的 `txCommit` / `txRollback` 采用“先执行、成功才改深度、失败先回滚”
+  并在主线程用 `commitStarted` 避免重复回滚。延迟外键导致的提交失败后，后续写入
+  可正常持久化。
+- **`WHERE` 条件退化为恒真（P0）** — 空操作符对象（`{}`）与操作符值全为 `undefined`
+  的对象此前生成恒真条件，使带“必须存在 WHERE”保护的 `update()` / `delete()` 仍可
+  全表生效；现在直接抛错。`Date` / `Map` / 类实例等非普通对象同样抛错并提示改用
+  `sql` 片段。
+- **异步 `insert(DEFAULT VALUES)` 并发返回错误行（P0）** — 删除基于全局
+  `SELECT last_insert_rowid()` 的跨 RPC 竞态，统一改用语句自带的
+  `run().lastInsertRowid`；并发插入各自返回正确行。
+- **`AsyncSqlo` 将无关并发操作拉入当前事务（P1）** — 引入 `AsyncLocalStorage`
+  标记事务上下文：只有从事务回调异步上下文发起的操作才加入事务，其它并发操作
+  走 FIFO 排队，不再被他人回滚。
+- **`migrate()` 不等待 async `up`（P1）** — 回调返回 thenable 时立即抛错（并吞掉
+  孤立 rejection），不再“谎报已应用”；失败迁移不写入版本表。
+- **多列 UNIQUE 反射丢失（P1）** — `reflect` 现在保留 `origin=u` 的多列唯一约束，
+  `schemaDiff` 结果收敛。
+- **空 WHERE group 破坏 AND/OR 对齐（P2）** — 生成条件前先过滤空组，操作符不再错位。
+- **`ORDER BY` 片段参数丢失（P2）** — 片段参数现在按占位符位置正确绑定（此前被
+  静默绑成 NULL）。
+- **`migrationStatus()` 只读（P2）** — 同步与异步都不再以建表作为副作用。
+- **`MultiSqlo` 迁移失败泄漏连接（P2）** — 引导失败时先 `close()` 再抛出。
+- **`loadMigrations` 加载** — 异步路径统一用 `pathToFileURL`（跨平台 / `.cjs`），
+  同步路径对 ESM 文件给出明确错误，不再是不透明的 `ERR_REQUIRE_ESM`。
+- **反射 `STRICT` 判定大小写不敏感** — 匹配 SQLite 的实际语义。
+- **`attach()` / `tableExists()` 标识符** — 拒绝带点数据库名与多义 `a.b.c`。
+
+### Changed
+
+- **破坏性：无法安全绑定的 WHERE 值改为抛错** — 依赖 `{ col: {} }` / `{ eq: undefined }`
+  匹配全表、或把 `Date` 当条件的调用方需改用显式条件或 `sql` 片段。
+- **破坏性：`AsyncSqlo` 事务加入语义收紧** — 仅事务回调自身异步上下文内的操作加入
+  当前事务。
+- **破坏性：`define()` 同名不再静默覆盖** — 连接按定义顺序保存全部模型，
+  `syncAll()` 同步每一个定义（DDL 幂等），不再丢失早期定义。
+- **多进程迁移竞态** — 同步与异步 `migrate()` 均改用 `BEGIN IMMEDIATE`，并在事务内
+  二次核对已应用状态。
+- **`MultiSqlo` 新增 `maxOpen`（默认 `100`）LRU 上限** — 超出上限时关闭并淘汰最近
+  最少使用的连接；传 `Infinity` 保留旧的无限缓存行为。已淘汰连接的旧引用下次
+  使用时抛错。
+
+### Added
+
+- **`baseColumns` — 连接级共享基础字段** — 在 `SqloOptions`（同步 `Sqlo`）与
+  `AsyncSqloOptions`（`AsyncSqlo`）上新增 `baseColumns`：为连接一次性声明公共列
+  （如 `id`、`created_at`），会在 `define()` 校验与生成 DDL 之前合并进每个
+  schema，各表无需重复书写。合并后的列完整参与类型推导（`RowOf` / `InsertOf` /
+  `PatchOf`），插入输入中基础字段保持可选（自增 / 默认值填充）；schema 中与
+  基础字段同名的列会覆盖该表的基础定义。`MultiSqloOptions.options` 同样透传。
+
+### Build
+
+- **ESLint 接入** — 新增 flat config 与 `npm run lint`，CI 与发布流程都会执行。
+- **跨平台构建** — `build` 脚本中的 `rm -rf` 替换为 `node scripts/clean.mjs`，
+  并新增 macOS / Windows CI 矩阵，构建不再依赖 POSIX shell。
+- **CI 矩阵扩展** — Node 22 / 24 × Linux / macOS / Windows（macOS、Windows 仅
+  在 Node 24 上运行）。
+- **迁移加载器兼容现代 Node** — `loadMigrationsSync` 现在同时映射
+  `ERR_REQUIRE_ESM`（Node < 22.12）与 `ERR_REQUIRE_ASYNC_MODULE`（现代 Node
+  用 `require()` 加载带顶层 await 的 ESM 时的报错码）。
+
+### Tests
+
+- **`test/robustness.test.ts` — 真实场景回归（15 条）** — 多进程迁移竞态（同步 /
+  异步各两个子进程，断言恰好一个应用）、worker 引导失败 fail-fast、迁移加载器
+  ESM 处理、`open()` 重开重放非默认 `journalMode`、故障注入（损坏库 → `file is
+  not a database`；只读库 → `attempt to write a readonly database`），以及种子化
+  安全 fuzz（列类型 / 标识符 / WHERE 值各 4000 次，断言不可注入）。
+- **并发迁移者二次核对（确定性）** — 由独立连接在 `BEGIN IMMEDIATE` 中提交版本行，
+  使迁移者在写锁上阻塞后走事务内二次核对分支，同步与异步两条路径都被覆盖。
+- **覆盖率门槛进 CI** — `npm run test:coverage` 设行 / 分支 / 函数 = 99 / 94 / 98；
+  当前实测 **行 99.76% / 分支 95.07% / 函数 98.99%**，仅剩两处故意不可达的防御分支
+  （`UNREACHABLE_EXECUTOR.prepare` 与 worker 未知 op 兜底）。
+- **`npm run bench` 微基准** — 手动运行、不进 CI；覆盖 SQL 构建、单事务插入、
+  `insertMany` 与 200 行查询。
+
 ## [0.6.0] - 2026-09-04
 
 ### Added

@@ -15,6 +15,14 @@
 
 > 要求 **Node.js ≥ 22.5.0**（`node:sqlite` 发布的版本）。
 
+> **稳定性。** Sqlo 尚未发布 1.0。它构建在 Node.js 的
+> [`node:sqlite`](https://nodejs.org/api/sqlite.html) 之上，而该模块目前仍被
+> Node.js 标记为**实验性**——其 API 可能随 Node 版本变化。生产环境请固定 Node
+> 版本，并关注 Node 更新日志。
+>
+> **支持矩阵。** Node.js 22.5+ 与 24，覆盖 Linux、macOS 和 Windows
+> （CI 在三个平台运行完整测试套件）。
+
 ---
 
 ## 为什么选择 Sqlo？
@@ -60,6 +68,8 @@ const users = db.define({
 //   readBigInts                     : 将 INTEGER 列读为 bigint（默认 false）
 //   enableDoubleQuotedStringLiterals: 透传给 node:sqlite
 //   allowExtension                  : 透传给 node:sqlite
+//   baseColumns                     : 合并进每个 define() schema 的共享列
+//                                      （如 id、created_at）——见「共享基础字段」
 users.sync();
 
 // insert 返回完整的、完全类型化的行。
@@ -130,6 +140,39 @@ users.sync();
 会在**加载时**即完成校验——JSON 里的结构性错误（列缺 `type`、索引指向未知列等）
 会带文件路径立即抛出，而不是延迟到 `define()`。注意 JSON 无法表达带绑定
 参数的片段——CHECK / WHERE 约束在 JSON 里必须是纯 SQL 字符串。
+
+### 共享基础字段
+
+拥有相同账本列（`id`、`created_at` 等）的表可以在连接上**一次性**声明这些列，
+而不是在每个 schema 里重复。在构造选项中传 `baseColumns`，这些列会在
+`define()` 校验与生成 DDL 之前合并进每个 schema：
+
+```ts
+import { Sqlo, sql } from '@chaeco/sqlo';
+
+const db = new Sqlo({
+  path: ':memory:',
+  baseColumns: {
+    id:         { type: 'INTEGER', primaryKey: true, autoIncrement: true },
+    created_at: { type: 'TEXT', notNull: true,
+                  default: sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))` },
+  },
+});
+
+// schema 只需声明自己的列——id 和 created_at 自动并入。
+const users = db.define({
+  name: 'users',
+  columns: { name: { type: 'TEXT', notNull: true } },
+});
+// users 行类型：{ id: number; created_at: string; name: string }
+
+users.sync(); // 创建 id, created_at, name
+```
+
+合并后的列完全参与类型推导：`RowOf` / `InsertOf` / `PatchOf` 都会包含它们，
+插入输入里基础字段是可选的（由自增 / 默认值填充）。**schema 中与基础字段同名
+的列会覆盖**该表的基础定义。`AsyncSqlo` 与 `MultiSqlo` 同样接受
+`baseColumns`。
 
 支持的列类型包括 `INTEGER`、`REAL`、`TEXT`、`BLOB`、`NUMERIC`、`BOOLEAN`、
 `DATE`、`DATETIME`、`TIMESTAMP` 等。映射的 JavaScript 类型会自动推导：
@@ -210,6 +253,10 @@ const deleted = users.delete({ id: u.id }); // → 受影响行数
 `update()` 和 `delete()` **必须**带 WHERE 条件——它们会抛出异常，而不是让你
 意外清空或覆盖整张表。对于有意的批量操作，使用 `db.exec('UPDATE ...')` 配合
 `sql\`...\`` 片段。
+
+无法安全绑定的 WHERE 值——空操作符对象（`{}`）、操作符值全为 `undefined` 的
+对象，或 `Date` 等非普通对象——同样会抛错，因此错误的条件绝不会静默退化为
+全表匹配。
 
 ## 查询构造器
 
@@ -552,6 +599,16 @@ db.transaction(() => {
 }, { retry: 5 });   // 承受短暂的写竞争
 ```
 
+### 每个进程使用一个同步连接
+
+同步的 `node:sqlite` 调用会阻塞 JavaScript 线程——`busy_timeout` 和
+`transaction({ retry })` 的等待同样发生在该线程内。若**同一进程内**的两个
+`Sqlo` 连接争抢写锁，持锁连接会因对方阻塞而无法执行 `COMMIT`，等待只能超时。
+跨进程竞争（常见的多写者场景）不受影响。
+
+建议：每个进程只用一个 `Sqlo` 连接。若需要并发或不想阻塞调用方，请使用
+`AsyncSqlo`——它的 worker 线程与非阻塞退避能让事件循环保持空闲。
+
 ### 大批量插入分块
 
 `insertMany(rows, { chunkSize })` 分块插入，每块独立事务（当不在外层事务
@@ -710,6 +767,11 @@ pool.closeAll();       // 关闭所有已打开的用户库
 安全：`userId` 会按 `^[A-Za-z0-9][A-Za-z0-9._-]*$` 校验以防止路径穿越，且文件名
 绝不允许包含路径分隔符。可通过 `fileName` 选项自定义文件命名。
 
+连接按用户缓存，并受 `maxOpen`（默认 `100`）限制：达到上限时，最近最少使用的
+用户连接会被**关闭**并淘汰，再打开新连接。因此托管大量不同租户的服务不会耗尽
+文件描述符。已淘汰连接的旧引用在下次使用时抛错——再次调用 `pool.for(userId)`
+即可重开。传 `maxOpen: Infinity` 可关闭淘汰。
+
 ## API 参考
 
 ### 类
@@ -767,6 +829,21 @@ pool.closeAll();       // 关闭所有已打开的用户库
 - ❌ 模拟跨进程锁
 - ❌ 强制异步
 - ❌ 默认引入第三方原生包
+
+## 开发
+
+```sh
+npm install
+npm run build            # 打包到 dist/（已提交；JS 用户无需构建）
+npm test                 # 构建 + 完整测试
+npm run typecheck        # tsc --noEmit
+npm run lint             # ESLint
+npm run test:coverage    # 测试 + 覆盖率门槛（行 99 / 分支 94 / 函数 98）
+npm run bench            # 本地微基准（不进 CI）
+```
+
+测试针对构建产物 `dist/` 运行，因此 `npm test` 会先重新构建。CI 在 Node 22 与
+24 上覆盖 Linux、macOS 和 Windows。
 
 ## 许可证
 

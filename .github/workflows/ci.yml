@@ -11,12 +11,19 @@ concurrency:
 
 jobs:
   test:
-    name: Test (Node ${{ matrix.node }})
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }}, Node ${{ matrix.node }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
         node: [22, 24] # 22 = 最低要求 (node:sqlite), 24 = 当前 LTS
+        exclude:
+          # Keep the pricier runners to the current LTS only.
+          - os: macos-latest
+            node: 22
+          - os: windows-latest
+            node: 22
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -30,11 +37,18 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Lint
+        run: npm run lint
+
       - name: Typecheck
         run: npm run typecheck
 
       - name: Test
         run: npm test
+
+      - name: Coverage thresholds
+        if: matrix.os == 'ubuntu-latest' && matrix.node == 24
+        run: npm run test:coverage
 
   examples:
     name: Examples build & run

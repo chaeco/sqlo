@@ -20,15 +20,18 @@
  */
 
 import { Worker } from 'node:worker_threads';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 import type { AsyncExecutor, AsyncTransaction } from './async-model';
 import { AsyncModel } from './async-model';
-import type { TableDef, RowOf, InsertOf, PatchOf, MigrationDef, MigrationStatus } from '../schema/types';
+import type { TableDef, RowOf, InsertOf, PatchOf, MigrationDef, MigrationStatus, BaseColumns, WithBaseColumns } from '../schema/types';
+import type { SqliteJournalMode } from '../core/sqlo';
 import { validateSchema, schemaHasReferences } from '../schema/validate';
 import {
   ensureMigrationTableSql,
+  migrationTableExistsSql,
   getAppliedMigrationsSql,
   insertMigrationRecordSql,
   computePending,
@@ -53,6 +56,7 @@ interface WorkerRequest {
     | 'run'
     | 'close'
     | 'txBegin'
+    | 'txBeginImmediate'
     | 'txCommit'
     | 'txRollback'
     | 'backup';
@@ -78,6 +82,50 @@ interface WorkerResponse {
 // ---------------------------------------------------------------------------
 
 /**
+ * Options for `AsyncSqlo`, forwarded to the worker's `DatabaseSync`
+ * connection. `baseColumns` are consumed on the main thread (merged into
+ * every `define()` schema) and never forwarded to the worker.
+ */
+export interface AsyncSqloOptions<B extends BaseColumns = BaseColumns> {
+  readBigInts?: boolean;
+  enableForeignKeyConstraints?: boolean;
+  enableDoubleQuotedStringLiterals?: boolean;
+  allowExtension?: boolean;
+  /**
+   * Busy timeout in ms for `PRAGMA busy_timeout` — how long a statement
+   * waits for the write lock before failing with SQLITE_BUSY. Defaults to
+   * 5000ms (matching the sync `Sqlo`); pass `0` for SQLite's raw fail-fast
+   * behaviour.
+   */
+  busyTimeout?: number | undefined;
+  /**
+   * Journal mode applied via `PRAGMA journal_mode` on open. Defaults to
+   * SQLite's own default (`DELETE`). Use `'WAL'` for concurrent read/write
+   * workloads.
+   */
+  journalMode?: SqliteJournalMode | undefined;
+  /**
+   * Base columns shared by every model defined on this connection. They are
+   * merged into each `define()` call's columns before the schema is validated
+   * and its DDL is generated, so a table never has to repeat them. A column
+   * with the same name declared directly on a schema overrides the base
+   * definition for that schema.
+   *
+   * ```ts
+   * const db = new AsyncSqlo(':memory:', {
+   *   baseColumns: {
+   *     id: { type: 'INTEGER', primaryKey: true, autoIncrement: true },
+   *     created_at: { type: 'TEXT', notNull: true, default: sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))` },
+   *   },
+   * });
+   * const users = db.define({ name: 'users', columns: { name: { type: 'TEXT' } } });
+   * // users has id, created_at, name
+   * ```
+   */
+  baseColumns?: B;
+}
+
+/**
  * Async wrapper around Sqlo that delegates database operations to a worker
  * thread, avoiding event-loop blocking in request-handling contexts.
  *
@@ -90,10 +138,11 @@ interface WorkerResponse {
  * models (`AsyncModel`), transactions, and migrations. Query construction
  * stays on the main thread; only execution crosses to the worker.
  */
-export class AsyncSqlo implements AsyncExecutor {
+export class AsyncSqlo<const B extends BaseColumns = {}> implements AsyncExecutor {
   readonly #worker: Worker;
   readonly #pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
-  readonly #models = new Map<string, { sync(): Promise<void> }>();
+  /** Every model defined on this connection (see the sync `Sqlo`). */
+  readonly #models: Array<{ sync(): Promise<void> }> = [];
   #nextId = 1;
   /**
    * Active transaction nesting depth on this connection. While > 0, ordinary
@@ -102,6 +151,12 @@ export class AsyncSqlo implements AsyncExecutor {
    * it on the FIFO lane, where an awaited call would deadlock the transaction.
    */
   #txDepth = 0;
+  /**
+   * Async context of the currently running transaction callback. Operations
+   * awaited from that context join the transaction; operations from any other
+   * context (another concurrent request on the same connection) are queued.
+   */
+  readonly #txContext = new AsyncLocalStorage<true>();
   /**
    * Worker liveness. Once the worker has errored or exited, every future
    * `#send` fails fast instead of posting a message that would never be
@@ -119,6 +174,7 @@ export class AsyncSqlo implements AsyncExecutor {
    */
   #tail: Promise<void> = Promise.resolve();
   readonly #fkEnabled: boolean;
+  readonly #baseColumns: B;
 
   /**
    * @param path Database file path (or `':memory:'`) opened inside the worker.
@@ -128,20 +184,26 @@ export class AsyncSqlo implements AsyncExecutor {
    *   same behaviour as the synchronous `Sqlo`. Foreign-key enforcement
    *   defaults to `true` (matching the synchronous `Sqlo`), so `define()` can
    *   warn when it is disabled while the schema declares references.
+   *   `baseColumns` are kept on the main thread and merged into every
+   *   `define()` schema — they are never sent to the worker.
    */
-  constructor(path: string, options?: Record<string, unknown>) {
+  constructor(path: string, options?: AsyncSqloOptions<B>) {
     // Align the foreign-key default with the sync Sqlo (#60): enforcement is
     // ON by default. Pass the resolved flag to the worker's DatabaseSync and
     // remember it here for the define() warning.
     const fkEnabled = options?.enableForeignKeyConstraints !== false;
     this.#fkEnabled = fkEnabled;
+    this.#baseColumns = options?.baseColumns ?? ({} as B);
+    // baseColumns are a main-thread concern — strip them so they never reach
+    // the worker's DatabaseSync options.
+    const { baseColumns: _baseColumns, ...forwarded } = options ?? {};
     // busyTimeout defaults to 5000ms for parity with the sync Sqlo; an
     // explicit value (including 0) wins. Resolve the default BEFORE the spread
     // so an explicit `busyTimeout: undefined` can't punch through and leave
     // the worker with SQLite's raw fail-fast default (0) while the sync Sqlo
     // would apply 5000ms.
     const workerOptions = {
-      ...options,
+      ...forwarded,
       busyTimeout: options?.busyTimeout ?? 5000,
       enableForeignKeyConstraints: fkEnabled,
     };
@@ -228,7 +290,12 @@ export class AsyncSqlo implements AsyncExecutor {
    * awaits it.
    */
   #dispatch<T>(op: WorkerRequest['op'], sql: string, params: unknown[] = []): Promise<T> {
-    if (this.#txDepth > 0) {
+    // Only operations issued from within the transaction callback's async
+    // context join the open transaction. Anything else — e.g. another
+    // concurrent request sharing this connection — is queued on the FIFO lane,
+    // so it can never be silently rolled back or committed with someone
+    // else's work. See #transactionOnce for where the context is established.
+    if (this.#txDepth > 0 && this.#txContext.getStore() === true) {
       return this.#send<T>(op, sql, params);
     }
     return this.#enqueue(() => this.#send<T>(op, sql, params));
@@ -304,12 +371,21 @@ export class AsyncSqlo implements AsyncExecutor {
    *
    * Does **not** create the table — call `users.sync()` or `db.syncAll()`.
    */
-  define<const S extends TableDef>(schema: S): AsyncModel<RowOf<S>, InsertOf<S>, PatchOf<S>> {
+  define<const S extends TableDef>(
+    schema: S,
+  ): AsyncModel<
+    RowOf<WithBaseColumns<S, B>>,
+    InsertOf<WithBaseColumns<S, B>>,
+    PatchOf<WithBaseColumns<S, B>>
+  > {
+    // Merge the connection-wide base columns into this schema (schema's own
+    // columns win on name collisions) before validation and DDL generation.
+    const merged = this.#withBaseColumns(schema);
     // Validate the schema
-    const { errors, warnings } = validateSchema(schema);
+    const { errors, warnings } = validateSchema(merged);
     if (errors.length > 0) {
       throw new Error(
-        `Invalid schema for table "${schema.name}":\n  ${errors.join('\n  ')}`,
+        `Invalid schema for table "${merged.name}":\n  ${errors.join('\n  ')}`,
       );
     }
     for (const warning of warnings) {
@@ -319,17 +395,21 @@ export class AsyncSqlo implements AsyncExecutor {
     // Foreign keys: warn when the schema declares references but the
     // connection has foreign-key enforcement disabled — the declared
     // ON DELETE / ON UPDATE actions would silently not fire.
-    if (!this.#fkEnabled && schemaHasReferences(schema)) {
+    if (!this.#fkEnabled && schemaHasReferences(merged)) {
       process.emitWarning(
-        `Table "${schema.name}" declares foreign key references but the connection has ` +
+        `Table "${merged.name}" declares foreign key references but the connection has ` +
         'foreign key enforcement disabled (enableForeignKeyConstraints: false). ' +
         'ON DELETE / ON UPDATE actions will NOT fire. Enable the option to enforce them.',
         { code: 'SQLO_FOREIGN_KEYS_DISABLED' },
       );
     }
 
-    const model = new AsyncModel<RowOf<S>, InsertOf<S>, PatchOf<S>>(this, schema);
-    this.#models.set(schema.name, model);
+    const model = new AsyncModel<
+      RowOf<WithBaseColumns<S, B>>,
+      InsertOf<WithBaseColumns<S, B>>,
+      PatchOf<WithBaseColumns<S, B>>
+    >(this, merged);
+    this.#models.push(model);
     return model;
   }
 
@@ -337,9 +417,15 @@ export class AsyncSqlo implements AsyncExecutor {
    * Create all defined tables and indexes.
    */
   async syncAll(): Promise<void> {
-    for (const model of this.#models.values()) {
+    for (const model of this.#models) {
       await model.sync();
     }
+  }
+
+  #withBaseColumns<S extends TableDef>(schema: S): TableDef {
+    const base = this.#baseColumns;
+    if (Object.keys(base).length === 0) return schema;
+    return { ...schema, columns: { ...base, ...schema.columns } };
   }
 
   // ---- Transaction ----
@@ -403,20 +489,32 @@ export class AsyncSqlo implements AsyncExecutor {
     }
   }
 
-  async #transactionOnce<T>(fn: (tx: AsyncTransaction) => Promise<T>): Promise<T> {
-    await this.#send('txBegin', '');
+  async #transactionOnce<T>(
+    fn: (tx: AsyncTransaction) => Promise<T>,
+    immediate = false,
+  ): Promise<T> {
+    await this.#send(immediate ? 'txBeginImmediate' : 'txBegin', '');
     this.#txDepth++;
     const tx = this.#makeTransaction();
+    let commitStarted = false;
 
     try {
-      const result = await fn(tx);
+      // `AsyncLocalStorage` scopes every awaited continuation of the callback
+      // to this transaction, so db-bound operations issued here join it while
+      // unrelated concurrent flows are queued (see #dispatch).
+      const result = await this.#txContext.run(true, () => fn(tx));
+      commitStarted = true;
       await this.#send('txCommit', '');
       return result;
     } catch (err) {
-      try {
-        await this.#send('txRollback', '');
-      } catch {
-        // A failed rollback must not mask the original error.
+      // If txCommit itself failed, the worker already unwound the transaction;
+      // sending a rollback would only desync its depth.
+      if (!commitStarted) {
+        try {
+          await this.#send('txRollback', '');
+        } catch {
+          // A failed rollback must not mask the original error.
+        }
       }
       throw err;
     } finally {
@@ -475,20 +573,30 @@ export class AsyncSqlo implements AsyncExecutor {
     for (const row of rows) applied.set(row.name, row.applied_at);
     const pending = computePending(migrations, applied);
 
+    const freshlyApplied: MigrationDef[] = [];
     for (const m of pending) {
+      let alreadyApplied = false;
       try {
-        await this.transaction(async (tx) => {
+        // BEGIN IMMEDIATE serializes concurrent migrators on the write lock;
+        // re-checking inside the transaction closes the race window.
+        await this.#transactionOnce(async (tx) => {
+          const rows = await tx.all<{ name: string }>(getAppliedMigrationsSql(schema));
+          if (rows.some((r) => r.name === m.name)) {
+            alreadyApplied = true;
+            return;
+          }
           await this.#applyMigration(tx, m, schema);
-        });
+        }, true);
       } catch (err) {
         throw new Error(
           `Migration "${m.name}" failed. DB has been rolled back.`,
           { cause: err },
         );
       }
+      if (!alreadyApplied) freshlyApplied.push(m);
     }
 
-    return pending;
+    return freshlyApplied;
   }
 
   async #applyMigration(tx: AsyncTransaction, m: MigrationDef, schema: string): Promise<void> {
@@ -513,11 +621,13 @@ export class AsyncSqlo implements AsyncExecutor {
     options?: MigrateOptions,
   ): Promise<MigrationStatus[]> {
     const schema = options?.schema ?? 'main';
-    await this.exec(ensureMigrationTableSql(schema));
-
-    const rows = await this.all<{ name: string; applied_at: string }>(getAppliedMigrationsSql(schema));
+    // Read-only: never create the version table as a side effect.
+    const exists = await this.get<{ ok: number }>(migrationTableExistsSql(schema));
     const applied = new Map<string, string>();
-    for (const row of rows) applied.set(row.name, row.applied_at);
+    if (exists !== undefined) {
+      const rows = await this.all<{ name: string; applied_at: string }>(getAppliedMigrationsSql(schema));
+      for (const row of rows) applied.set(row.name, row.applied_at);
+    }
 
     return migrations.map((m) => ({
       name: m.name,

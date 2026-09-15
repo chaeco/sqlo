@@ -82,9 +82,10 @@ parentPort.on('message', (msg) => {
                 });
                 break;
             }
-            case 'txBegin': {
+            case 'txBegin':
+            case 'txBeginImmediate': {
                 if (txDepth === 0) {
-                    db.exec('BEGIN');
+                    db.exec(msg.op === 'txBeginImmediate' ? 'BEGIN IMMEDIATE' : 'BEGIN');
                 }
                 else {
                     db.exec(`SAVEPOINT "sqlo_sp_${txDepth}"`);
@@ -98,13 +99,34 @@ parentPort.on('message', (msg) => {
                     handleError(msg.id, new Error('txCommit without an open transaction.'));
                     break;
                 }
-                txDepth--;
-                if (txDepth === 0) {
-                    db.exec('COMMIT');
+                const target = txDepth - 1;
+                try {
+                    if (target === 0) {
+                        db.exec('COMMIT');
+                    }
+                    else {
+                        db.exec(`RELEASE SAVEPOINT "sqlo_sp_${target}"`);
+                    }
                 }
-                else {
-                    db.exec(`RELEASE SAVEPOINT "sqlo_sp_${txDepth}"`);
+                catch (err) {
+                    // SQLite leaves the transaction open when COMMIT/RELEASE fails.
+                    // Unwind it before reporting so the worker's depth and the
+                    // connection never disagree (which caused "cannot start a
+                    // transaction within a transaction" on the next attempt).
+                    try {
+                        if (target === 0)
+                            db.exec('ROLLBACK');
+                        else
+                            db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${target}"`);
+                    }
+                    catch {
+                        // best effort — the commit error is what matters
+                    }
+                    txDepth = target;
+                    handleError(msg.id, err);
+                    break;
                 }
+                txDepth = target;
                 send(msg.id, true);
                 break;
             }
@@ -113,14 +135,26 @@ parentPort.on('message', (msg) => {
                     handleError(msg.id, new Error('txRollback without an open transaction.'));
                     break;
                 }
-                txDepth--;
-                if (txDepth === 0) {
-                    db.exec('ROLLBACK');
+                const target = txDepth - 1;
+                let failure;
+                try {
+                    if (target === 0) {
+                        db.exec('ROLLBACK');
+                    }
+                    else {
+                        db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${target}"`);
+                    }
                 }
-                else {
-                    db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${txDepth}"`);
+                catch (err) {
+                    failure = err;
                 }
-                send(msg.id, true);
+                // The caller is aborting: always unwind the depth, even when the
+                // rollback reports "no transaction is active".
+                txDepth = target;
+                if (failure !== undefined)
+                    handleError(msg.id, failure);
+                else
+                    send(msg.id, true);
                 break;
             }
             case 'backup': {

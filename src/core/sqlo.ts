@@ -5,13 +5,14 @@
 import { DatabaseSync, type DatabaseSync as DatabaseSyncType } from 'node:sqlite';
 
 type SQLInputValue = number | bigint | string | Uint8Array | null;
-import type { TableDef, MigrationDef, MigrationStatus, RowOf, InsertOf, PatchOf } from '../schema/types';
+import type { TableDef, MigrationDef, MigrationStatus, RowOf, InsertOf, PatchOf, BaseColumns, WithBaseColumns } from '../schema/types';
 import { validateSchema, schemaHasReferences } from '../schema/validate';
 import { Model } from '../model/model';
 import type { Executor } from '../query/query-builder';
 import { quoteIdent } from '../query/sql';
 import {
   ensureMigrationTableSql,
+  migrationTableExistsSql,
   getAppliedMigrationsSql,
   insertMigrationRecordSql,
   computePending,
@@ -42,7 +43,12 @@ export type SqliteJournalMode =
   | 'WAL'
   | 'OFF';
 
-export interface SqloOptions {
+/** Runtime whitelist for `journalMode` — it is interpolated into a PRAGMA. */
+const JOURNAL_MODES = new Set<SqliteJournalMode>([
+  'DELETE', 'TRUNCATE', 'PERSIST', 'MEMORY', 'WAL', 'OFF',
+]);
+
+export interface SqloOptions<B extends BaseColumns = BaseColumns> {
   path?: string;
   open?: boolean;
   readBigInts?: boolean;
@@ -76,6 +82,26 @@ export interface SqloOptions {
    * Set to `'debug'` to observe every query.
    */
   logLevel?: LogLevel;
+  /**
+   * Base columns shared by every model defined on this connection. They are
+   * merged into each `define()` call's columns before the schema is validated
+   * and its DDL is generated, so a table never has to repeat them. A column
+   * with the same name declared directly on a schema overrides the base
+   * definition for that schema.
+   *
+   * ```ts
+   * const db = new Sqlo({
+   *   path: ':memory:',
+   *   baseColumns: {
+   *     id: { type: 'INTEGER', primaryKey: true, autoIncrement: true },
+   *     created_at: { type: 'TEXT', notNull: true, default: sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))` },
+   *   },
+   * });
+   * const users = db.define({ name: 'users', columns: { name: { type: 'TEXT' } } });
+   * // users has id, created_at, name
+   * ```
+   */
+  baseColumns?: B;
 }
 
 export interface MigrateOptions {
@@ -99,10 +125,17 @@ export interface MigrateOptions {
  * (`all` / `get` / `run`), transactions, SQL-file migrations, and raw access
  * to the underlying instance. SQLite-only, zero native dependencies.
  */
-export class Sqlo implements Executor {
+export class Sqlo<const B extends BaseColumns = {}> implements Executor {
   readonly #db: DatabaseSyncType;
-  readonly #options: Required<Omit<SqloOptions, 'onLog'>> & { onLog?: (entry: LogEntry) => void };
-  #models: Map<string, { sync(): void }> = new Map();
+  readonly #options: Required<Omit<SqloOptions<B>, 'onLog' | 'baseColumns'>> & { onLog?: (entry: LogEntry) => void };
+  readonly #baseColumns: B;
+  /**
+   * Every model defined on this connection, in definition order. A list (not a
+   * name→model map) so that re-defining a table — e.g. after `close()` +
+   * `open()` — never silently drops an earlier definition from syncAll().
+   * The generated DDL is `IF NOT EXISTS`, so repeats are harmless.
+   */
+  #models: Array<{ sync(): void }> = [];
   #closed = false;
   /** Re-entry guard: prevents an `onLog` callback from triggering new log events. */
   #logging = false;
@@ -115,9 +148,16 @@ export class Sqlo implements Executor {
    * const db = new Sqlo({ path: './app.db' });
    * ```
    */
-  constructor(options: SqloOptions | string = {}) {
-    const opts: SqloOptions = typeof options === 'string' ? { path: options } : { ...options };
+  constructor(options: SqloOptions<B> | string = {}) {
+    const opts: SqloOptions<B> = typeof options === 'string' ? { path: options } : { ...options };
     const path = opts.path ?? ':memory:';
+
+    if (opts.journalMode !== undefined && !JOURNAL_MODES.has(opts.journalMode)) {
+      throw new Error(
+        `Invalid journalMode: "${String(opts.journalMode)}". ` +
+        `Expected one of: ${[...JOURNAL_MODES].join(', ')}.`,
+      );
+    }
 
     this.#options = {
       path,
@@ -135,6 +175,7 @@ export class Sqlo implements Executor {
       logLevel: opts.logLevel ?? 'warn',
       ...(opts.onLog !== undefined ? { onLog: opts.onLog } : {}),
     };
+    this.#baseColumns = opts.baseColumns ?? ({} as B);
 
     this.#db = new DatabaseSync(path, {
       open: this.#options.open,
@@ -226,6 +267,11 @@ export class Sqlo implements Executor {
     if (dot > 0) {
       schema = name.slice(0, dot);
       table = name.slice(dot + 1);
+      if (table.includes('.')) {
+        throw new Error(
+          `Invalid table name "${name}": expected "table" or "schema.table".`,
+        );
+      }
     }
     const sql = schema
       ? `SELECT 1 FROM ${quoteIdent(schema)}.sqlite_master WHERE type = 'table' AND tbl_name = ?`
@@ -439,20 +485,23 @@ export class Sqlo implements Executor {
     }
   }
 
-  #transactionOnce<T>(fn: () => T): T {
+  #transactionOnce<T>(fn: () => T, mode: 'DEFERRED' | 'IMMEDIATE' = 'DEFERRED'): T {
     this.#ensureOpen();
-    const isTop = this.#txDepth === 0;
+    const entryDepth = this.#txDepth;
+    const isTop = entryDepth === 0;
     if (isTop) {
-      this.#db.exec('BEGIN');
-      this.#log('transaction', 'BEGIN transaction');
+      // BEGIN IMMEDIATE acquires the write lock up front (used by migrate()).
+      this.#db.exec(mode === 'IMMEDIATE' ? 'BEGIN IMMEDIATE' : 'BEGIN');
+      this.#log('transaction', mode === 'IMMEDIATE' ? 'BEGIN IMMEDIATE transaction' : 'BEGIN transaction');
     } else {
-      this.#db.exec(`SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
-      this.#log('transaction', `BEGIN SAVEPOINT (depth ${this.#txDepth})`);
+      this.#db.exec(`SAVEPOINT "sqlo_sp_${entryDepth}"`);
+      this.#log('transaction', `BEGIN SAVEPOINT (depth ${entryDepth})`);
     }
-    this.#txDepth++;
+    this.#txDepth = entryDepth + 1;
 
+    let result: T;
     try {
-      const result = fn();
+      result = fn();
       // Guard the classic misuse: an async callback resolves AFTER this method
       // has returned, so awaiting inside it would silently run outside the
       // (already committed) transaction. Fail loudly instead.
@@ -466,31 +515,55 @@ export class Sqlo implements Executor {
           'use AsyncSqlo.transaction() instead.',
         );
       }
-      this.#txDepth--;
-      if (this.#txDepth === 0) {
-        this.#db.exec('COMMIT');
-        this.#log('transaction', 'COMMIT transaction');
-      } else {
-        this.#db.exec(`RELEASE SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
-        this.#log('transaction', `RELEASE SAVEPOINT (depth ${this.#txDepth})`);
-      }
-      return result;
     } catch (err) {
-      this.#txDepth--;
       try {
-        if (this.#txDepth === 0) {
+        if (isTop) {
           this.#db.exec('ROLLBACK');
           this.#log('transaction', 'ROLLBACK transaction', { level: 'warn' });
         } else {
-          this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
-          this.#log('transaction', `ROLLBACK TO SAVEPOINT (depth ${this.#txDepth})`, { level: 'warn' });
+          this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${entryDepth}"`);
+          this.#log('transaction', `ROLLBACK TO SAVEPOINT (depth ${entryDepth})`, { level: 'warn' });
         }
       } catch {
         // The rollback itself failed (e.g. the failing statement already
         // aborted the transaction). Never let that mask the original error.
+      } finally {
+        // Always restore the depth exactly once, whatever the rollback did.
+        this.#txDepth = entryDepth;
       }
       throw err;
     }
+
+    // fn succeeded — finish the transaction. If COMMIT/RELEASE itself fails
+    // (SQLITE_BUSY, deferred FK, disk full, ...) SQLite leaves the transaction
+    // open; roll it back and restore the depth so the connection is never left
+    // inside an orphaned transaction that would silently swallow later writes.
+    try {
+      if (isTop) {
+        this.#db.exec('COMMIT');
+        this.#log('transaction', 'COMMIT transaction');
+      } else {
+        this.#db.exec(`RELEASE SAVEPOINT "sqlo_sp_${entryDepth}"`);
+        this.#log('transaction', `RELEASE SAVEPOINT (depth ${entryDepth})`);
+      }
+    } catch (err) {
+      try {
+        if (isTop) {
+          this.#db.exec('ROLLBACK');
+          this.#log('transaction', 'ROLLBACK transaction after failed COMMIT', { level: 'warn' });
+        } else {
+          this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${entryDepth}"`);
+          this.#log('transaction', `ROLLBACK TO SAVEPOINT (depth ${entryDepth}) after failed RELEASE`, { level: 'warn' });
+        }
+      } catch {
+        // Best effort — the original COMMIT/RELEASE error is what matters.
+      }
+      this.#txDepth = entryDepth;
+      throw err;
+    }
+
+    this.#txDepth = entryDepth;
+    return result;
   }
 
   // ---- Multiple databases (ATTACH / DETACH) ----
@@ -510,6 +583,14 @@ export class Sqlo implements Executor {
    */
   attach(path: string, name: string): void {
     this.#ensureOpen();
+    // The schema name cannot be a bound parameter — validate it. `quoteIdent`
+    // rejects invalid identifiers; we additionally reject dotted names because
+    // ATTACH AS expects a single, dot-free database name.
+    if (name.includes('.')) {
+      throw new Error(
+        `Invalid database name: "${name}". ATTACH requires a plain name without dots.`,
+      );
+    }
     const ident = quoteIdent(name);
     // The schema name cannot be a bound parameter — it's an identifier, so
     // it is validated and quoted; the file path is always bound.
@@ -546,13 +627,20 @@ export class Sqlo implements Executor {
    */
   define<const S extends TableDef>(
     schema: S,
-  ): Model<RowOf<S>, InsertOf<S>, PatchOf<S>> {
+  ): Model<
+    RowOf<WithBaseColumns<S, B>>,
+    InsertOf<WithBaseColumns<S, B>>,
+    PatchOf<WithBaseColumns<S, B>>
+  > {
     this.#ensureOpen();
+    // Merge the connection-wide base columns into this schema (schema's own
+    // columns win on name collisions) before validation and DDL generation.
+    const merged = this.#withBaseColumns(schema);
     // Validate the schema
-    const { errors, warnings } = validateSchema(schema);
+    const { errors, warnings } = validateSchema(merged);
     if (errors.length > 0) {
       throw new Error(
-        `Invalid schema for table "${schema.name}":\n  ${errors.join('\n  ')}`,
+        `Invalid schema for table "${merged.name}":\n  ${errors.join('\n  ')}`,
       );
     }
     for (const warning of warnings) {
@@ -562,21 +650,31 @@ export class Sqlo implements Executor {
     // Foreign keys: warn when the schema declares references but the
     // connection has foreign-key enforcement disabled — the declared
     // ON DELETE / ON UPDATE actions would silently not fire.
-    if (!this.#options.enableForeignKeyConstraints && schemaHasReferences(schema)) {
+    if (!this.#options.enableForeignKeyConstraints && schemaHasReferences(merged)) {
       process.emitWarning(
-        `Table "${schema.name}" declares foreign key references but the connection has ` +
+        `Table "${merged.name}" declares foreign key references but the connection has ` +
         'foreign key enforcement disabled (enableForeignKeyConstraints: false). ' +
         'ON DELETE / ON UPDATE actions will NOT fire. Enable the option to enforce them.',
         { code: 'SQLO_FOREIGN_KEYS_DISABLED' },
       );
     }
 
-    const model = new Model<RowOf<S>, InsertOf<S>, PatchOf<S>>(this, schema);
-    this.#models.set(schema.name, model);
-    this.#log('schema', `define model for "${schema.name}"`, {
-      detail: `${Object.keys(schema.columns).length} columns, ${schema.indexes?.length ?? 0} indexes`,
+    const model = new Model<
+      RowOf<WithBaseColumns<S, B>>,
+      InsertOf<WithBaseColumns<S, B>>,
+      PatchOf<WithBaseColumns<S, B>>
+    >(this, merged);
+    this.#models.push(model);
+    this.#log('schema', `define model for "${merged.name}"`, {
+      detail: `${Object.keys(merged.columns).length} columns, ${merged.indexes?.length ?? 0} indexes`,
     });
     return model;
+  }
+
+  #withBaseColumns<S extends TableDef>(schema: S): TableDef {
+    const base = this.#baseColumns;
+    if (Object.keys(base).length === 0) return schema;
+    return { ...schema, columns: { ...base, ...schema.columns } };
   }
 
   /**
@@ -584,7 +682,7 @@ export class Sqlo implements Executor {
    */
   syncAll(): void {
     this.#ensureOpen();
-    for (const model of this.#models.values()) {
+    for (const model of this.#models) {
       model.sync();
     }
   }
@@ -613,52 +711,49 @@ export class Sqlo implements Executor {
     const applied = this.#getAppliedMigrations(schema);
     const pending = computePending(migrations, applied);
 
+    const freshlyApplied: MigrationDef[] = [];
     for (const m of pending) {
-      // Participate in an outer transaction when present (nested via SAVEPOINT),
-      // otherwise open a dedicated transaction per migration so that already
-      // applied migrations survive a later failure.
-      if (this.#txDepth === 0) {
-        this.#db.exec('BEGIN');
-      } else {
-        this.#db.exec(`SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
-      }
-      this.#txDepth++;
+      // Each migration gets its own transaction (or a SAVEPOINT inside an
+      // outer one). BEGIN IMMEDIATE makes two processes racing to migrate the
+      // same database serialize on the write lock; re-checking inside the
+      // transaction closes the window where the other process committed while
+      // we were waiting for the lock.
+      let alreadyApplied = false;
       try {
-        this.#applyMigration(m, schema);
-        this.#log('migrate', `applied migration "${m.name}"`, { detail: `schema "${schema}"` });
-        this.#txDepth--;
-        if (this.#txDepth === 0) {
-          this.#db.exec('COMMIT');
-        } else {
-          this.#db.exec(`RELEASE SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
-        }
-      } catch (err) {
-        this.#txDepth--;
-        this.#log('migrate', `migration "${m.name}" failed`, { detail: `schema "${schema}"`, level: 'error' });
-        try {
-          if (this.#txDepth === 0) {
-            this.#db.exec('ROLLBACK');
-          } else {
-            this.#db.exec(`ROLLBACK TO SAVEPOINT "sqlo_sp_${this.#txDepth}"`);
+        this.#transactionOnce(() => {
+          if (this.#getAppliedMigrations(schema).has(m.name)) {
+            alreadyApplied = true;
+            return;
           }
-        } catch {
-          // Rollback already handled by the failing statement — keep going.
-        }
+          this.#applyMigration(m, schema);
+        }, 'IMMEDIATE');
+      } catch (err) {
+        this.#log('migrate', `migration "${m.name}" failed`, { detail: `schema "${schema}"`, level: 'error' });
         const scope = this.#txDepth === 0 ? 'transaction rolled back' : 'rolled back to savepoint';
         throw new Error(
           `Migration "${m.name}" failed (${scope}).`,
           { cause: err },
         );
       }
+
+      if (alreadyApplied) {
+        this.#log('migrate', `migration "${m.name}" already applied by another process`, {
+          detail: `schema "${schema}"`,
+          level: 'warn',
+        });
+      } else {
+        freshlyApplied.push(m);
+        this.#log('migrate', `applied migration "${m.name}"`, { detail: `schema "${schema}"` });
+      }
     }
 
-    if (pending.length > 0) {
-      this.#log('migrate', `applied ${pending.length} migration(s)`, { detail: `schema "${schema}"` });
+    if (freshlyApplied.length > 0) {
+      this.#log('migrate', `applied ${freshlyApplied.length} migration(s)`, { detail: `schema "${schema}"` });
     } else {
       this.#log('migrate', 'no pending migrations', { detail: `schema "${schema}"` });
     }
 
-    return pending;
+    return freshlyApplied;
   }
 
   /**
@@ -668,8 +763,11 @@ export class Sqlo implements Executor {
   migrationStatus(migrations: MigrationDef[], options?: MigrateOptions): MigrationStatus[] {
     this.#ensureOpen();
     const schema = options?.schema ?? 'main';
-    this.#ensureMigrationTable(schema);
-    const applied = this.#getAppliedMigrations(schema);
+    // Read-only: do NOT create the version table here — a status query must
+    // not mutate the database.
+    const applied = this.#migrationTableExists(schema)
+      ? this.#getAppliedMigrations(schema)
+      : new Map<string, string>();
 
     return migrations.map((m) => ({
       name: m.name,
@@ -732,6 +830,11 @@ export class Sqlo implements Executor {
     this.#db.exec(ensureMigrationTableSql(schema));
   }
 
+  #migrationTableExists(schema: string): boolean {
+    const row = this.#db.prepare(migrationTableExistsSql(schema)).get() as { ok: number } | undefined;
+    return row !== undefined;
+  }
+
   #getAppliedMigrations(schema: string): Map<string, string> {
     const rows = this.#db.prepare(getAppliedMigrationsSql(schema)).all() as { name: string; applied_at: string }[];
     const map = new Map<string, string>();
@@ -747,7 +850,20 @@ export class Sqlo implements Executor {
     if (typeof m.up === 'string') {
       this.#db.exec(m.up);
     } else {
-      m.up({ exec: (sql: string) => this.#db.exec(sql) });
+      const result = m.up({ exec: (sql: string) => this.#db.exec(sql) }) as unknown;
+      if (
+        result !== null && typeof result === 'object' &&
+        typeof (result as { then?: unknown }).then === 'function'
+      ) {
+        // Swallow the async rejection we are about to orphan; the clear
+        // synchronous error below is what the caller must see. Recording the
+        // migration as applied (the old behaviour) would be a silent lie.
+        void (result as Promise<unknown>).catch(() => {});
+        throw new TypeError(
+          `Migration "${m.name}" returned a Promise from an async up(). ` +
+          'The synchronous Sqlo.migrate() cannot await it — use a synchronous up() or AsyncSqlo.migrate().',
+        );
+      }
     }
 
     this.#db.prepare(insertMigrationRecordSql(schema)).run(m.name, ts);

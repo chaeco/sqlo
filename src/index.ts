@@ -28,6 +28,7 @@ export { loadTableDefSync } from './schema/json';
 export { loadMigrations, loadMigrationsSync } from './migration/migration';
 
 export { AsyncSqlo } from './async/async';
+export type { AsyncSqloOptions } from './async/async';
 export { AsyncModel, AsyncQueryBuilder } from './async/async-model';
 export type { AsyncExecutor, AsyncTransaction } from './async/async-model';
 
@@ -39,6 +40,8 @@ export type {
   RefAction,
   SqliteType,
   SqlOptions,
+  BaseColumns,
+  WithBaseColumns,
 
   TypeToJs,
   ColumnValue,

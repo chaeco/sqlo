@@ -26,6 +26,21 @@ const VALID_REF_ACTIONS = new Set([
   'CASCADE', 'SET NULL', 'SET DEFAULT', 'RESTRICT', 'NO ACTION',
 ]);
 
+/**
+ * SQLite accepts arbitrary type names (type affinity), including multi-word
+ * names like `UNSIGNED BIG INT`, `DOUBLE PRECISION` and sized forms like
+ * `VARCHAR(255)` / `DECIMAL(10,5)`. But the type name is emitted verbatim
+ * into DDL, so it must not be able to carry SQL metacharacters. This pattern
+ * allows the legitimate shapes and rejects `;`, quotes, comments, and
+ * parentheses beyond a numeric size.
+ */
+const SAFE_COLUMN_TYPE_RE = /^[A-Za-z_][A-Za-z0-9_ ]*(?:\(\s*\d+\s*(?:,\s*\d+\s*)?\))?$/;
+
+/** Runtime guard: is `type` a safe SQLite type name for DDL emission? */
+export function isSafeColumnType(type: unknown): type is string {
+  return typeof type === 'string' && SAFE_COLUMN_TYPE_RE.test(type);
+}
+
 export function schemaHasReferences(schema: TableDef): boolean {
   return Object.values(schema.columns).some((col) => col.references !== undefined);
 }
@@ -52,6 +67,12 @@ export function validateSchema(schema: TableDef): { errors: string[]; warnings: 
     const col = schema.columns[name]!;
     if (!col.type) {
       errors.push(`Column "${name}" is missing a "type".`);
+    } else if (!isSafeColumnType(col.type)) {
+      errors.push(
+        `Column "${name}": unsupported/unsafe type "${col.type}". ` +
+          'Types must be a plain SQLite type name (letters, digits, spaces) with an optional ' +
+          'numeric size, e.g. TEXT, INTEGER, VARCHAR(255), UNSIGNED BIG INT.',
+      );
     } else if (!VALID_COLUMN_TYPES.has(col.type.toUpperCase())) {
       // SQLite accepts arbitrary type names (type affinity). Follow SQLite's
       // semantics but warn — a non-standard type name is often a typo.

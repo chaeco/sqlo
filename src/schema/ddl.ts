@@ -5,6 +5,7 @@
 
 import type { ColumnDef, TableDef, SqlFragment } from './types';
 import { isFragment, quoteIdent, isValidIdent } from '../query/sql';
+import { isSafeColumnType } from './validate';
 
 // ---------------------------------------------------------------------------
 // Fragment coercion
@@ -62,6 +63,14 @@ function escapeDefaultLiteral(value: unknown): string {
 export function columnDDL(col: ColumnDef<string>): string {
   const parts: string[] = [];
 
+  // The type is emitted verbatim, so reject anything that could carry SQL
+  // metacharacters even when a schema bypassed `define()`/`validateSchema`.
+  if (!isSafeColumnType(col.type)) {
+    throw new Error(
+      `Invalid/unsafe column type: "${String(col.type)}". ` +
+        'Types must be a plain SQLite type name (letters, digits, spaces) with an optional numeric size.',
+    );
+  }
   parts.push(col.type.toUpperCase());
 
   if (col.primaryKey) parts.push('PRIMARY KEY');

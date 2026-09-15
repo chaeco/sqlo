@@ -68,6 +68,18 @@ interface TableDef<C extends Record<string, ColumnDef<string>> = Record<string, 
     /** Appends WITHOUT ROWID */
     withoutRowId?: boolean;
 }
+/**
+ * Shared base columns injected into every model defined on a connection
+ * (`SqloOptions.baseColumns` / `AsyncSqloOptions.baseColumns`). A per-schema
+ * column with the same name overrides the base column.
+ */
+type BaseColumns = Record<string, ColumnDef<string>>;
+/**
+ * Merge `B` (base columns) into a table definition's columns, then give the
+ * schema's own columns priority on name collisions:
+ * `columns: { ...base, ...schema.columns }`.
+ */
+type WithBaseColumns<S extends TableDef, B extends BaseColumns> = TableDef<Omit<B, keyof S['columns']> & S['columns']> & Pick<S, 'name'>;
 interface TypeToJs {
     INTEGER: number;
     REAL: number;
@@ -449,7 +461,7 @@ interface LogEntry {
  * - `OFF` — no journaling (largest risk of database corruption)
  */
 type SqliteJournalMode = 'DELETE' | 'TRUNCATE' | 'PERSIST' | 'MEMORY' | 'WAL' | 'OFF';
-interface SqloOptions {
+interface SqloOptions<B extends BaseColumns = BaseColumns> {
     path?: string;
     open?: boolean;
     readBigInts?: boolean;
@@ -483,6 +495,26 @@ interface SqloOptions {
      * Set to `'debug'` to observe every query.
      */
     logLevel?: LogLevel;
+    /**
+     * Base columns shared by every model defined on this connection. They are
+     * merged into each `define()` call's columns before the schema is validated
+     * and its DDL is generated, so a table never has to repeat them. A column
+     * with the same name declared directly on a schema overrides the base
+     * definition for that schema.
+     *
+     * ```ts
+     * const db = new Sqlo({
+     *   path: ':memory:',
+     *   baseColumns: {
+     *     id: { type: 'INTEGER', primaryKey: true, autoIncrement: true },
+     *     created_at: { type: 'TEXT', notNull: true, default: sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))` },
+     *   },
+     * });
+     * const users = db.define({ name: 'users', columns: { name: { type: 'TEXT' } } });
+     * // users has id, created_at, name
+     * ```
+     */
+    baseColumns?: B;
 }
 interface MigrateOptions {
     /**
@@ -500,7 +532,7 @@ interface MigrateOptions {
  * (`all` / `get` / `run`), transactions, SQL-file migrations, and raw access
  * to the underlying instance. SQLite-only, zero native dependencies.
  */
-declare class Sqlo implements Executor {
+declare class Sqlo<const B extends BaseColumns = {}> implements Executor {
     #private;
     /**
      * Open (or create) a SQLite database.
@@ -510,7 +542,7 @@ declare class Sqlo implements Executor {
      * const db = new Sqlo({ path: './app.db' });
      * ```
      */
-    constructor(options?: SqloOptions | string);
+    constructor(options?: SqloOptions<B> | string);
     /**
      * Returns the raw `node:sqlite` DatabaseSync instance for direct use.
      */
@@ -652,7 +684,7 @@ declare class Sqlo implements Executor {
      *
      * Does **not** create the table — call `users.sync()` or `db.syncAll()`.
      */
-    define<const S extends TableDef>(schema: S): Model<RowOf<S>, InsertOf<S>, PatchOf<S>>;
+    define<const S extends TableDef>(schema: S): Model<RowOf<WithBaseColumns<S, B>>, InsertOf<WithBaseColumns<S, B>>, PatchOf<WithBaseColumns<S, B>>>;
     /**
      * Create all defined tables and indexes.
      */
@@ -710,7 +742,7 @@ declare class Sqlo implements Executor {
  * ```
  */
 
-interface MultiSqloOptions {
+interface MultiSqloOptions<B extends BaseColumns = BaseColumns> {
     /** Directory that holds one database file per user. */
     dir: string;
     /**
@@ -722,14 +754,25 @@ interface MultiSqloOptions {
     migrations?: MigrationDef[];
     /**
      * Connection options forwarded to each user's `Sqlo` instance
-     * (e.g. `enableForeignKeyConstraints`).
+     * (e.g. `enableForeignKeyConstraints`, `baseColumns`).
      */
-    options?: SqloOptions;
+    options?: SqloOptions<B>;
     /**
      * Map a userId to a database file name (without extension). Defaults to
      * `${userId}.db`. Must not introduce path separators.
      */
     fileName?: (userId: string) => string;
+    /**
+     * Maximum number of simultaneously open per-user connections. When the cap
+     * is reached, the **least-recently-used** connection is closed and evicted
+     * before a new one is opened. Defaults to `100`; pass `Infinity` to
+     * disable eviction (the behaviour before this option existed).
+     *
+     * Evicted connections are really closed: a reference you still hold will
+     * throw `database is not open` on its next use. Call `for(userId)` again
+     * to reopen.
+     */
+    maxOpen?: number;
 }
 /**
  * Per-user database manager for multi-tenant applications.
@@ -738,20 +781,20 @@ interface MultiSqloOptions {
  * dedicated Sqlo connection, so data is fully isolated across users. New
  * databases are created and baseline-migrated automatically on first access.
  */
-declare class MultiSqlo {
+declare class MultiSqlo<const B extends BaseColumns = {}> {
     #private;
     /**
      * @param opts Directory to store per-user databases, baseline migrations,
      *   connection options, and an optional file-name strategy.
      */
-    constructor(opts: MultiSqloOptions);
+    constructor(opts: MultiSqloOptions<B>);
     /**
      * Get the Sqlo instance for a user, creating and migrating their database
      * on first access. The instance is cached and reused across calls.
      *
      * @throws if `userId` is not a safe file name component.
      */
-    for(userId: string): Sqlo;
+    for(userId: string): Sqlo<B>;
     /**
      * Whether a user's instance is currently open (cached).
      */
@@ -1273,6 +1316,49 @@ declare class AsyncModel<Row extends Record<string, unknown>, Insert, Patch> {
  */
 
 /**
+ * Options for `AsyncSqlo`, forwarded to the worker's `DatabaseSync`
+ * connection. `baseColumns` are consumed on the main thread (merged into
+ * every `define()` schema) and never forwarded to the worker.
+ */
+interface AsyncSqloOptions<B extends BaseColumns = BaseColumns> {
+    readBigInts?: boolean;
+    enableForeignKeyConstraints?: boolean;
+    enableDoubleQuotedStringLiterals?: boolean;
+    allowExtension?: boolean;
+    /**
+     * Busy timeout in ms for `PRAGMA busy_timeout` — how long a statement
+     * waits for the write lock before failing with SQLITE_BUSY. Defaults to
+     * 5000ms (matching the sync `Sqlo`); pass `0` for SQLite's raw fail-fast
+     * behaviour.
+     */
+    busyTimeout?: number | undefined;
+    /**
+     * Journal mode applied via `PRAGMA journal_mode` on open. Defaults to
+     * SQLite's own default (`DELETE`). Use `'WAL'` for concurrent read/write
+     * workloads.
+     */
+    journalMode?: SqliteJournalMode | undefined;
+    /**
+     * Base columns shared by every model defined on this connection. They are
+     * merged into each `define()` call's columns before the schema is validated
+     * and its DDL is generated, so a table never has to repeat them. A column
+     * with the same name declared directly on a schema overrides the base
+     * definition for that schema.
+     *
+     * ```ts
+     * const db = new AsyncSqlo(':memory:', {
+     *   baseColumns: {
+     *     id: { type: 'INTEGER', primaryKey: true, autoIncrement: true },
+     *     created_at: { type: 'TEXT', notNull: true, default: sql`(strftime('%Y-%m-%dT%H:%M:%fZ','now'))` },
+     *   },
+     * });
+     * const users = db.define({ name: 'users', columns: { name: { type: 'TEXT' } } });
+     * // users has id, created_at, name
+     * ```
+     */
+    baseColumns?: B;
+}
+/**
  * Async wrapper around Sqlo that delegates database operations to a worker
  * thread, avoiding event-loop blocking in request-handling contexts.
  *
@@ -1285,7 +1371,7 @@ declare class AsyncModel<Row extends Record<string, unknown>, Insert, Patch> {
  * models (`AsyncModel`), transactions, and migrations. Query construction
  * stays on the main thread; only execution crosses to the worker.
  */
-declare class AsyncSqlo implements AsyncExecutor {
+declare class AsyncSqlo<const B extends BaseColumns = {}> implements AsyncExecutor {
     #private;
     /**
      * @param path Database file path (or `':memory:'`) opened inside the worker.
@@ -1295,8 +1381,10 @@ declare class AsyncSqlo implements AsyncExecutor {
      *   same behaviour as the synchronous `Sqlo`. Foreign-key enforcement
      *   defaults to `true` (matching the synchronous `Sqlo`), so `define()` can
      *   warn when it is disabled while the schema declares references.
+     *   `baseColumns` are kept on the main thread and merged into every
+     *   `define()` schema — they are never sent to the worker.
      */
-    constructor(path: string, options?: Record<string, unknown>);
+    constructor(path: string, options?: AsyncSqloOptions<B>);
     /**
      * Execute a SQL string (no return value).
      */
@@ -1334,7 +1422,7 @@ declare class AsyncSqlo implements AsyncExecutor {
      *
      * Does **not** create the table — call `users.sync()` or `db.syncAll()`.
      */
-    define<const S extends TableDef>(schema: S): AsyncModel<RowOf<S>, InsertOf<S>, PatchOf<S>>;
+    define<const S extends TableDef>(schema: S): AsyncModel<RowOf<WithBaseColumns<S, B>>, InsertOf<WithBaseColumns<S, B>>, PatchOf<WithBaseColumns<S, B>>>;
     /**
      * Create all defined tables and indexes.
      */
@@ -1413,4 +1501,4 @@ declare class AsyncSqlo implements AsyncExecutor {
 }
 
 export { AsyncModel, AsyncQueryBuilder, AsyncSqlo, Model, MultiSqlo, QueryBuilder, SQLITE, Sqlo, columnDDL, generateMigrationSql, indexDDLs, isBusyError, isConstraintError, isFragment, isIdent, loadMigrations, loadMigrationsSync, loadTableDefSync, quoteIdent, quoteTable, raw, reflectTableSchema, schemaDiff, sql, tableDDL };
-export type { AsyncExecutor, AsyncTransaction, ColumnDef, ColumnValue, Ident, IndexDef, InsertOf, LogEntry, LogEvent, LogLevel, MigrateOptions, MigrationDef, MigrationStatus, MultiSqloOptions, OrderDir, PatchOf, RefAction, RowOf, SchemaDiff, SqlFragment, SqlOptions, SqliteErrorLike, SqliteType, SqloOptions, TableDef, TypeToJs, WhereExpr, WhereOps, WhereValue };
+export type { AsyncExecutor, AsyncSqloOptions, AsyncTransaction, BaseColumns, ColumnDef, ColumnValue, Ident, IndexDef, InsertOf, LogEntry, LogEvent, LogLevel, MigrateOptions, MigrationDef, MigrationStatus, MultiSqloOptions, OrderDir, PatchOf, RefAction, RowOf, SchemaDiff, SqlFragment, SqlOptions, SqliteErrorLike, SqliteType, SqloOptions, TableDef, TypeToJs, WhereExpr, WhereOps, WhereValue, WithBaseColumns };

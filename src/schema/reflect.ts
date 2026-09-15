@@ -105,15 +105,21 @@ function reflectRaw(exec: Executor, table: string): TableDef<Record<string, Colu
   const indexes: IndexDef[] = [];
   for (const idx of idxRows) {
     if (idx.origin === 'u') {
-      // UNIQUE constraint → surface as `unique: true` on the column,
-      // not as a standalone index.
+      // UNIQUE constraint → single column becomes `unique: true` on the
+      // column; a multi-column constraint is preserved as a unique index (it
+      // used to be dropped entirely, so schemaDiff kept trying to re-add it).
       const info = exec.prepare(`PRAGMA ${schemaIdent}.index_info(${quoteIdent(idx.name)})`).all() as unknown as PRAGMA_IndexInfo[];
-      const cols = info.sort((a, b) => a.seqno - b.seqno).map((i) => i.name);
-      if (cols.length === 1 && cols[0] !== null) {
+      const cols = info
+        .sort((a, b) => a.seqno - b.seqno)
+        .map((i) => i.name)
+        .filter((n): n is string => n !== null);
+      if (cols.length === 1) {
         const col = columns[cols[0]!];
         if (col) col.unique = true;
-        continue;
+      } else if (cols.length > 1) {
+        indexes.push({ name: idx.name, columns: cols, unique: true });
       }
+      continue;
     }
     // origin 'pk' (primary key) is already captured in column definitions.
     if (idx.origin !== 'c') continue;
@@ -150,7 +156,7 @@ function reflectRaw(exec: Executor, table: string): TableDef<Record<string, Colu
   ).get('table', name) as { sql: string } | undefined;
   if (sqlRow?.sql) {
     const stripped = stripQuoted(sqlRow.sql);
-    strict = /\bSTRICT\b/.test(stripped);
+    strict = /\bSTRICT\b/i.test(stripped);
     withoutRowId = /\bWITHOUT\s+ROWID\b/i.test(stripped);
   }
 

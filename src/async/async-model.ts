@@ -335,10 +335,14 @@ export class AsyncModel<Row extends Record<string, unknown>, Insert, Patch> {
    */
   async insert(data: Insert): Promise<Row> {
     validateKeys(this.#schema, this.table, data);
-    const { sql, values, isEmpty } = buildInsertSql(this.#schema, this.table, data);
+    const { sql, values } = buildInsertSql(this.#schema, this.table, data);
     const result = await this.#exec.run(sql, ...values);
-    const rid = isEmpty ? await this.#lastInsertRowid() : result.lastInsertRowid;
-    const { sql: selSql, params } = resolveAfterInsertSql(this.#schema, this.table, data, rid);
+    // `run().lastInsertRowid` is correct even for INSERT ... DEFAULT VALUES,
+    // and — unlike a separate `SELECT last_insert_rowid()` RPC — it is bound to
+    // this statement, so concurrent inserts cannot resolve each other's row.
+    const { sql: selSql, params } = resolveAfterInsertSql(
+      this.#schema, this.table, data, result.lastInsertRowid,
+    );
     return (await this.#exec.get(selSql, ...params)) as Row;
   }
 
@@ -529,14 +533,5 @@ export class AsyncModel<Row extends Record<string, unknown>, Insert, Patch> {
    */
   withExecutor(exec: AsyncExecutor): AsyncModel<Row, Insert, Patch> {
     return new AsyncModel<Row, Insert, Patch>(exec, this.#schema);
-  }
-
-  // ---- Internal ----
-
-  async #lastInsertRowid(): Promise<number | bigint> {
-    const row = await this.#exec.get<{ rid: number | bigint }>(
-      'SELECT last_insert_rowid() AS "rid"',
-    );
-    return row?.rid ?? 0;
   }
 }
