@@ -5,6 +5,29 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.1] - 2026-09-15
+
+本次为 0.7.0 之后的构建 / CI 修复补丁：**运行时行为与 0.7.0 完全一致**，发布的
+`dist/` 产物字节相同。
+
+### Fixed
+
+- **Windows 构建路径** — `scripts/rewrite-tests.mjs` 用 `new URL(...).pathname`
+  拼接路径，在 Windows 上得到 `/D:/...`，最终解析成 `D:\D:\...` 并抛出 `ENOENT`，
+  导致 Windows 上的 `npm test` 在构建阶段即中断。改用 `fileURLToPath` 取得真实
+  平台路径。（`scripts/rewrite-dts.mjs` 有同样写法，已随死代码一并删除。）
+
+### Changed
+
+- **GitHub Actions 升级到 Node 24 运行时** — `actions/checkout@v7`、
+  `actions/setup-node@v7`、`actions/upload-pages-artifact@v5`、
+  `actions/deploy-pages@v5`，消除 Node 20 弃用告警。
+
+### Removed
+
+- **`scripts/rewrite-dts.mjs`** — 无任何引用的死代码。`rollup-plugin-dts` 已产出
+  单个打包的 `dist/index.d.ts`，其中不含相对 `.ts` 引用，该脚本运行时为空操作。
+
 ## [0.7.0] - 2026-09-15
 
 本次为一次全面审计后的修复版本，包含若干**破坏性行为变更**（见“Changed”），
